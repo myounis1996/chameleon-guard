@@ -20,9 +20,13 @@ you choose* — and stops lying the moment you detach.
 
 ## Screenshots
 
-**Identities** — each profile is a self-consistent set of fake hardware IDs; one click generates a fresh one, one click activates it.
+**Identities** — each profile is a self-consistent set of fake hardware IDs; one click generates a fresh one, one click activates it. **Verify active** proves, per identifier, what apps actually receive.
 
 ![Identities](docs/identities.png)
+
+**Launch & Attach** — one-click guarded launch for detected AI CLIs and editors, attach-to-running, and an auto-attach watcher that instruments apps the moment they start.
+
+![Launch & Attach](docs/launch.png)
 
 **Live Monitor** — every hardware-ID call a protected app makes, in real time, with the real value it asked for and the value served back.
 
