@@ -150,6 +150,12 @@ async function loadTargets() {
   const wt = $("#wmiToggle");
   if (wt) wt.checked = !!r.wmi;
 
+  const w = r.watch || {};
+  const wtoggle = $("#watchToggle");
+  if (wtoggle) wtoggle.checked = !!w.enabled;
+  const wnames = $("#watchNames");
+  if (wnames && document.activeElement !== wnames) wnames.value = (w.names || []).join(", ");
+
   // AI CLI agents
   const cli = $("#cliCards");
   if (cli) {
@@ -213,6 +219,18 @@ function renderFiles(items) {
   }).join("");
 }
 
+/* --------------------------------------------------------------- verify */
+function renderVerify(r) {
+  const rows = r.checks.map((c) => `<div class="vrow ${c.pass ? "ok" : "bad"}">
+    <span class="vmark">${c.pass ? "✓" : "✗"}</span>
+    <span class="vname">${esc(c.name)}</span>
+    <span class="vval">${c.pass ? esc(c.expected)
+      : esc(c.error ? ("error: " + c.error) : ("real value leaked — " + c.snippet))}</span></div>`).join("");
+  const all = r.passed === r.total;
+  $("#verifyResults").innerHTML =
+    `<div class="vsum">${r.passed}/${r.total} identifiers served the fake value${all ? " — fully covered ✅" : ""}</div>` + rows;
+}
+
 /* -------------------------------------------------------------- polling */
 async function pollLive() {
   if (!api) return;
@@ -255,6 +273,27 @@ function wire() {
   $("#wmiToggle").addEventListener("change", async (e) => {
     await api.set_wmi_coverage(e.target.checked);
     toast(e.target.checked ? "WMI coverage on (applies to next launch)" : "WMI coverage off", "ok");
+  });
+
+  $("#btnVerify").addEventListener("click", async () => {
+    $("#verifyPanel").hidden = false;
+    $("#verifyResults").innerHTML = `<div class="vsum">Running self-test — launching probe tools under the guard…</div>`;
+    const r = await api.verify_profile();
+    if (!r.ok) { $("#verifyResults").innerHTML = `<div class="vsum">${esc(r.error)}</div>`; return; }
+    renderVerify(r);
+    toast(`${r.passed}/${r.total} identifiers covered`, r.passed === r.total ? "ok" : "err");
+  });
+
+  $("#watchToggle").addEventListener("change", async (e) => {
+    const r = await api.set_watcher(e.target.checked);
+    if (!r.ok) { toast(r.error, "err"); e.target.checked = false; }
+    else toast(e.target.checked ? "Auto-attach watcher on" : "Auto-attach off", "ok");
+  });
+  $("#btnSaveWatch").addEventListener("click", async () => {
+    const names = $("#watchNames").value.split(",").map((s) => s.trim()).filter(Boolean);
+    const r = await api.set_watch_list(names);
+    $("#watchNames").value = (r.names || []).join(", ");
+    toast("Watch list saved", "ok");
   });
 
   // delegated clicks

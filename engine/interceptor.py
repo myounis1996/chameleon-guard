@@ -56,6 +56,13 @@ class GuardEngine:
         self._child_q: "queue.Queue" = queue.Queue()
         self._worker = threading.Thread(target=self._child_worker, daemon=True)
         self._worker.start()
+
+        # auto-attach watcher
+        self._watch_names: set = set()
+        self._watch_stop = threading.Event()
+        self._watcher_thread = None
+        self._watch_seen: set = set()
+
         self.device.on("child-added", self._on_child_added)
 
     # ---------------------------------------------------------------- names
@@ -237,6 +244,91 @@ class GuardEngine:
             pids = list(self._session_refs.keys())
         for pid in pids:
             self.stop(pid)
+
+    # ------------------------------------------------- verify (capture)
+    def run_and_capture(self, program: str, args: list = None, timeout: float = 5.0) -> str:
+        """Spawn a leaf tool under the agent, capture its stdout, return it.
+
+        Used by the profile self-test. Kept separate from the live sessions/stats
+        so a verify run doesn't pollute the monitor.
+        """
+        if not self.config_provider():
+            raise RuntimeError("No active profile selected.")
+        argv = [program] + (args or [])
+        box = {"pid": None, "buf": bytearray()}
+
+        def on_output(pid, fd, data):
+            if data and pid == box["pid"]:
+                box["buf"].extend(bytes(data))
+
+        self.device.on("output", on_output)
+        session = None
+        done = threading.Event()
+        try:
+            pid = self.device.spawn(argv, stdio="pipe")
+            box["pid"] = pid
+            session = self.device.attach(pid)
+            session.on("detached", lambda *a: done.set())
+            try:
+                script = session.create_script(self._agent_source())
+                script.load()
+            except Exception:
+                pass
+            self.device.resume(pid)
+            done.wait(timeout)         # returns as soon as the tool exits
+            time.sleep(0.2)            # small grace for final stdout to flush
+            return bytes(box["buf"]).decode("utf-8", "replace")
+        finally:
+            try:
+                self.device.kill(box["pid"])
+            except Exception:
+                pass
+            if session:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+            try:
+                self.device.off("output", on_output)
+            except Exception:
+                pass
+
+    # ------------------------------------------------- auto-attach watcher
+    def start_watcher(self, names):
+        self._watch_names = set(n.lower() for n in names)
+        self._watch_seen.clear()
+        if self._watcher_thread and self._watcher_thread.is_alive():
+            return
+        self._watch_stop.clear()
+        self._watcher_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._watcher_thread.start()
+
+    def stop_watcher(self):
+        self._watch_stop.set()
+        self._watcher_thread = None
+
+    def watcher_running(self) -> bool:
+        return bool(self._watcher_thread and self._watcher_thread.is_alive())
+
+    def _watch_loop(self):
+        me = os.getpid()
+        while not self._watch_stop.is_set():
+            try:
+                if self.config_provider():           # only when an identity is active
+                    with self._lock:
+                        active = set(self._sessions.keys())
+                    for p in self.device.enumerate_processes():
+                        if p.pid == me or p.pid in self._watch_seen or p.pid in active:
+                            continue
+                        if p.name.lower() in self._watch_names:
+                            self._watch_seen.add(p.pid)
+                            try:
+                                self._instrument(p.pid, name_hint=p.name)
+                            except Exception as e:
+                                self._log_error(p.pid, p.name, f"watch attach: {e}")
+            except Exception:
+                pass
+            self._watch_stop.wait(2.0)
 
     # ---------------------------------------------------------------- read
     def live(self) -> dict:

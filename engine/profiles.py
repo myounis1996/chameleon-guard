@@ -198,6 +198,26 @@ class ProfileStore:
         st["wmi_coverage"] = bool(val)
         self._write_state(st)
 
+    DEFAULT_WATCH = ["Code.exe", "Code - Insiders.exe", "Cursor.exe",
+                     "VSCodium.exe", "Windsurf.exe"]
+
+    def get_watch_list(self) -> list:
+        v = self._read_state().get("watch_list")
+        return list(v) if v is not None else list(self.DEFAULT_WATCH)
+
+    def set_watch_list(self, names: list) -> None:
+        st = self._read_state()
+        st["watch_list"] = [str(n).strip() for n in names if str(n).strip()]
+        self._write_state(st)
+
+    def get_watcher_enabled(self) -> bool:
+        return bool(self._read_state().get("watcher_enabled"))
+
+    def set_watcher_enabled(self, val: bool) -> None:
+        st = self._read_state()
+        st["watcher_enabled"] = bool(val)
+        self._write_state(st)
+
     # -- profiles --
     def _path(self, pid: str) -> Path:
         return self.profiles_dir / f"{pid}.json"

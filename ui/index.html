@@ -52,7 +52,14 @@
             <h1>Identities</h1>
             <p class="muted">Each identity is a self-consistent set of fake hardware IDs. One click makes a fresh one.</p>
           </div>
-          <button class="btn primary big" id="btnNewIdentity">＋ New Identity</button>
+          <div style="display:flex;gap:10px">
+            <button class="btn big" id="btnVerify">Verify active</button>
+            <button class="btn primary big" id="btnNewIdentity">＋ New Identity</button>
+          </div>
+        </div>
+        <div class="panel" id="verifyPanel" hidden>
+          <div class="panel-title">Verification — what apps actually see under the active identity</div>
+          <div id="verifyResults"></div>
         </div>
         <div class="cards" id="identityCards"></div>
       </section>
@@ -131,6 +138,19 @@
             </div>
             <div class="proc-list" id="procList"></div>
           </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Auto-attach watcher</div>
+          <label class="wmi-toggle" style="margin-bottom:12px">
+            <input type="checkbox" id="watchToggle" />
+            <span>Auto-attach these apps the moment they start</span>
+          </label>
+          <div class="row">
+            <input type="text" id="watchNames" class="input" placeholder="Code.exe, Cursor.exe, node.exe" />
+            <button class="btn" id="btnSaveWatch">Save list</button>
+          </div>
+          <div class="muted" style="margin-top:8px;font-size:11.5px">Polls every ~2s and instruments matching processes automatically. May miss identity reads in the first second of an app's startup.</div>
         </div>
 
         <div class="panel">

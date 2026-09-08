@@ -78,6 +78,12 @@ class Api:
         self.idfiles = IdentityFileManager(DATA / "backups")
         self.engine = GuardEngine(AGENT, config_provider=self._active_config)
         self._window = None
+        # resume the auto-attach watcher if it was left enabled
+        if self.store.get_watcher_enabled() and self.store.get_active_id():
+            try:
+                self.engine.start_watcher(self.store.get_watch_list())
+            except Exception:
+                pass
 
     # -------------------------------------------------- internal
     def _active_config(self):
@@ -151,11 +157,76 @@ class Api:
         self.store.set_enabled(flag)
         if not flag:
             self.engine.stop_all()
+            self.engine.stop_watcher()
+            self.store.set_watcher_enabled(False)
         return {"ok": True, **self._active_summary()}
 
     def set_wmi_coverage(self, flag):
         self.store.set_wmi(bool(flag))
         return {"ok": True, **self._active_summary()}
+
+    # -------------------------------------------------- verify self-test
+    def verify_profile(self):
+        aid = self.store.get_active_id()
+        prof = self.store.get(aid) if aid else None
+        if not prof:
+            return {"ok": False, "error": "Select or create an identity first."}
+        win = os.environ.get("WINDIR", r"C:\Windows")
+
+        def cap(prog, args, wait=5.0):
+            try:
+                return self.engine.run_and_capture(prog, args, wait)
+            except Exception as e:
+                return f"__ERR__:{e}"
+
+        vser = prof["volume_serial"] & 0xFFFFFFFF
+        volfmt = f"{vser:08X}"[:4] + "-" + f"{vser:08X}"[4:]
+        checks = [
+            self._vcheck("MachineGuid (registry)", prof["machine_guid"],
+                cap(rf"{win}\System32\reg.exe", ["QUERY", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])),
+            self._vcheck("BIOS serial (WMI)", prof["bios_serial"],
+                cap(rf"{win}\System32\wbem\WMIC.exe", ["bios", "get", "serialnumber"])),
+            self._vcheck("MAC address (WMI)", prof["mac_str"],
+                cap(rf"{win}\System32\wbem\WMIC.exe", ["nic", "get", "macaddress"])),
+            self._vcheck("Disk serial (WMI)", prof["disk_serial"],
+                cap(rf"{win}\System32\wbem\WMIC.exe", ["diskdrive", "get", "serialnumber"])),
+            self._vcheck("Volume serial", volfmt,
+                cap(rf"{win}\System32\cmd.exe", ["/c", "vol", "C:"])),
+            self._vcheck("Hostname", prof["computer_name"],
+                cap(rf"{win}\System32\WindowsPowerShell\v1.0\powershell.exe", ["-NoProfile", "-Command", "[Environment]::MachineName"])),
+        ]
+        return {"ok": True, "checks": checks, "passed": sum(c["pass"] for c in checks), "total": len(checks)}
+
+    def _vcheck(self, name, expected, out):
+        err = out.startswith("__ERR__")
+        ok = (not err) and (expected.lower() in out.lower())
+        return {"name": name, "expected": expected, "pass": bool(ok),
+                "error": out[8:] if err else None,
+                "snippet": " ".join(out.split())[:90]}
+
+    # -------------------------------------------------- auto-attach watcher
+    def get_watch_config(self):
+        return {"enabled": self.store.get_watcher_enabled(),
+                "running": self.engine.watcher_running(),
+                "names": self.store.get_watch_list()}
+
+    def set_watch_list(self, names):
+        self.store.set_watch_list(names or [])
+        if self.store.get_watcher_enabled():
+            self.engine.start_watcher(self.store.get_watch_list())
+        return {"ok": True, **self.get_watch_config()}
+
+    def set_watcher(self, flag):
+        flag = bool(flag)
+        if flag and not self.store.get_active_id():
+            return {"ok": False, "error": "Select an identity first."}
+        self.store.set_watcher_enabled(flag)
+        if flag:
+            self.store.set_enabled(True)
+            self.engine.start_watcher(self.store.get_watch_list())
+        else:
+            self.engine.stop_watcher()
+        return {"ok": True, **self.get_watch_config()}
 
     def get_live(self):
         data = self.engine.live()
@@ -180,7 +251,8 @@ class Api:
             base = os.path.basename(t["path"]).lower() if t["path"] else ""
             t["running"] = running.get(base, [])
         return {"targets": launch, "cli_agents": discover_cli_agents(),
-                "identity_files": self.idfiles.status(), **self._active_summary()}
+                "identity_files": self.idfiles.status(), "watch": self.get_watch_config(),
+                **self._active_summary()}
 
     def list_processes(self):
         out = []

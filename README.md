@@ -46,12 +46,13 @@ approach you actually want for privacy from *specific apps*:
 
 | Identifier | Windows function(s) hooked | Verified |
 |---|---|---|
-| **MachineGuid**, SQMClient MachineId, ProductId | `RegQueryValueEx`, `RegGetValue`, `RegEnumValue` | ✅ |
+| **MachineGuid**, SQMClient MachineId, ProductId, HwProfileGuid, BuildGUID, SusClientId | `RegQueryValueEx`, `RegGetValue`, `RegEnumValue` | ✅ |
 | **SMBIOS** system/board/chassis serial, system UUID, CPU id | `GetSystemFirmwareTable('RSMB')` | ✅ |
 | **MAC** addresses | `GetAdaptersAddresses`, `GetAdaptersInfo` | ✅ |
 | **Volume serial** | `GetVolumeInformation(W/A)`, `…ByHandleW` | ✅ |
-| **Hostname** | `GetComputerName(W/A)` | ✅ |
-| **WMI** serials / UUID / ProcessorId / MAC / hostname | client-side COM: `IWbemClassObject::Get` + property-enum `Next` | ✅ |
+| **Physical disk serial** | `DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY)` | ✅ |
+| **Hostname** | `GetComputerName(W/A)`; `GetComputerNameEx` caller-guarded (RPC-safe) | ✅ |
+| **WMI** serials / UUID / ProcessorId / MAC / disk / hostname | client-side COM: `IWbemClassObject::Get` + property-enum `Next` | ✅ |
 
 The `reg.exe` child process that `node-machine-id` (used by VS Code / Electron
 apps) shells out to is caught automatically via Frida **child-gating**.
@@ -72,6 +73,15 @@ GitHub Copilot (`copilot` / `gh copilot`), Gemini, Aider, Cursor Agent, Qwen,
 opencode, Amazon Q — and launches them in a guarded shell so child-gating
 instruments the node/python/reg helpers they spawn.
 
+### Verify & auto-attach
+- **Verify active** (Identities tab) launches a set of probe tools *under the
+  guard* and shows, per identifier, whether the app actually receives the
+  profile's fake value — live proof that coverage is working.
+- **Auto-attach watcher** (Launch tab) instruments a configurable watch-list of
+  apps the moment they start, so you don't have to launch each one through the
+  guard. It polls every ~2s, so reads in the first second of an app's startup
+  can slip through — launch-through-guard stays exact when that matters.
+
 ### Identity Files (complementary layer)
 Some apps cache their id in a file instead of re-reading it. VS Code, its forks
 (Insiders / VSCodium / Cursor) and Copilot-in-VS-Code keep telemetry ids in
@@ -84,10 +94,12 @@ into it, reversibly.
 
 ## Honest limitations
 
-* **MI / CIM stack not rewritten.** `Get-CimInstance` (and apps using the newer
-  MI API / `mi.dll`) use a different path than classic WMI and are not
-  intercepted. Classic WMI (`wmic`, .NET `System.Management`, `Get-WmiObject`)
-  **is** covered.
+* **MI / CIM stack not rewritten.** `Get-CimInstance` (and apps on the newer MI
+  API) read results through `mi.dll` function tables whose in-memory layout does
+  not match the public `mi.h` on current Windows builds, so a reliable
+  cross-version hook isn't feasible without per-build offset maintenance (which
+  would risk crashing apps). Classic WMI — `wmic`, .NET `System.Management`,
+  `Get-WmiObject`, and Node libs that shell out to `wmic` — **is** fully covered.
 * **Hostname vs. local RPC.** Hostname is spoofed via `GetComputerName` and in
   WMI results, but **not** `GetComputerNameEx` — local RPC/DCOM binds to the WMI
   host through it, so spoofing it there breaks WMI (crashes .NET). The WMI hook
