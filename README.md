@@ -100,10 +100,11 @@ into it, reversibly.
   cross-version hook isn't feasible without per-build offset maintenance (which
   would risk crashing apps). Classic WMI — `wmic`, .NET `System.Management`,
   `Get-WmiObject`, and Node libs that shell out to `wmic` — **is** fully covered.
-* **Hostname vs. local RPC.** Hostname is spoofed via `GetComputerName` and in
-  WMI results, but **not** `GetComputerNameEx` — local RPC/DCOM binds to the WMI
-  host through it, so spoofing it there breaks WMI (crashes .NET). The WMI hook
-  redirects a client's fake-host connection back to local so `wmic` still works.
+* **Hostname vs. local RPC.** Hostname is spoofed via `GetComputerName` and
+  `GetComputerNameEx`, plus WMI results. Since local RPC/DCOM binds to the WMI
+  host through `GetComputerNameEx`, that hook only rewrites when the caller isn't
+  a system RPC/COM/WMI module, and the WMI hook redirects a client's fake-host
+  connection back to local — so apps see the fake name while WMI keeps working.
 * **Run as Administrator** to attach to already-running processes and to
   instrument elevated targets.
 * **Anti-tamper / EDR.** Frida injects into the target; hardened apps or
@@ -136,15 +137,25 @@ pip install -r requirements.txt
 python app.py
 ```
 
-### Usage (minimal clicks)
-1. **Identities** tab → **＋ New Identity** (generates a full, consistent fake
-   machine in one click; the first one auto-activates).
-2. **Launch & Attach** tab → **Launch protected** on a detected app, or paste an
-   `.exe` path / a CLI command (e.g. `codex`), or attach to a running process.
-3. **Live Monitor** tab → watch every intercepted call, real → served, per app
-   and per function.
-4. Toggle **Protection** off (top-right) to detach everything and restore real
-   values.
+### Usage
+1. **Identities** — **＋ New Identity** generates a full, consistent fake machine
+   in one click (the first auto-activates); **Activate** any card to switch.
+   **Verify active** launches probe tools *under the guard* and shows, per
+   identifier, whether apps really receive the fake value.
+2. **Launch & Attach**
+   - **AI CLI agents**: one-click **Launch protected** for detected CLIs (Codex,
+     Claude Code, Copilot, Gemini, Aider, …).
+   - **Detected apps**: **Launch protected** for VS Code / Cursor / …, or paste
+     any `.exe` path or command line.
+   - **Attach** to an already-running process.
+   - **Auto-attach watcher**: toggle on and set a watch-list to instrument apps
+     automatically as they start.
+   - **WMI coverage** toggle (applies to the next launch).
+3. **Live Monitor** — every intercepted call in real time: counts per app and per
+   function, and real → served for each.
+4. **Identity Files** — for VS Code-family apps that cache their id in
+   `storage.json`; backed up before any change and restorable.
+5. **Protection** toggle (top-right) detaches everything and restores real values.
 
 ---
 
@@ -153,7 +164,8 @@ python app.py
 ```
 hw_profile/
 ├─ app.py                    # pywebview window + JS API bridge + app discovery
-├─ run.bat                   # launcher
+├─ run.bat                   # launcher (double-click)
+├─ build-release.bat         # build dist\Chameleon.exe (double-click)
 ├─ requirements.txt
 ├─ engine/
 │  ├─ profiles.py            # identity generator + profile store
@@ -167,8 +179,11 @@ hw_profile/
 
 ## Building the release .exe
 
-A single self-contained `dist\Chameleon.exe` (~52 MB), dead modules excluded and
-compiled with `--optimize 2`:
+**Double-click `build-release.bat`** — it locates Python, installs the build
+dependencies, and produces a single self-contained `dist\Chameleon.exe` (~52 MB,
+dead modules excluded, compiled with `--optimize 2`).
+
+Or run the equivalent manually:
 
 ```bat
 pip install pyinstaller
