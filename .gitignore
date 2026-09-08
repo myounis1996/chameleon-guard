@@ -1,0 +1,23 @@
+# Runtime data: generated identity profiles, engine state, and backups of real
+# app identity files (these contain REAL machine IDs) — never commit.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller / build output
+build/
+dist/
+*.spec
+
+# Editors / OS
+.vscode/
+.idea/
+*.log
+Thumbs.db
+.DS_Store

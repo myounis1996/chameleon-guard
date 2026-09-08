@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chameleon</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ---------------------------------------------------------- header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">🦎</div>
+        <div class="brand-text">
+          <div class="brand-name">Chameleon</div>
+          <div class="brand-sub">Hardware Identity Guard</div>
+        </div>
+      </div>
+
+      <div class="active-chip" id="activeChip" title="Active identity">
+        <span class="dot"></span>
+        <span id="activeChipName">No identity</span>
+      </div>
+
+      <div class="master">
+        <div class="master-label">
+          <span id="masterState">Protection off</span>
+          <small id="masterHint">launch an app to begin</small>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="masterToggle" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </header>
+
+    <!-- ------------------------------------------------------------- nav -->
+    <nav class="tabs">
+      <button class="tab active" data-view="identities">Identities</button>
+      <button class="tab" data-view="monitor">Live Monitor <span class="badge" id="tabSessions">0</span></button>
+      <button class="tab" data-view="launch">Launch &amp; Attach</button>
+      <button class="tab" data-view="files">Identity Files</button>
+      <button class="tab" data-view="help">How it works</button>
+    </nav>
+
+    <main>
+      <!-- ------------------------------------------------ identities -->
+      <section class="view active" id="view-identities">
+        <div class="view-head">
+          <div>
+            <h1>Identities</h1>
+            <p class="muted">Each identity is a self-consistent set of fake hardware IDs. One click makes a fresh one.</p>
+          </div>
+          <button class="btn primary big" id="btnNewIdentity">＋ New Identity</button>
+        </div>
+        <div class="cards" id="identityCards"></div>
+      </section>
+
+      <!-- --------------------------------------------------- monitor -->
+      <section class="view" id="view-monitor">
+        <div class="view-head">
+          <div><h1>Live Monitor</h1>
+          <p class="muted">Every hardware-ID call made by a protected app, in real time.</p></div>
+          <button class="btn ghost" id="btnResetStats">Reset</button>
+        </div>
+        <div class="stat-row" id="statRow"></div>
+        <div class="monitor-grid">
+          <div class="panel">
+            <div class="panel-title">By function</div>
+            <div id="byApi" class="barlist"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-title">By app</div>
+            <div id="byApp" class="barlist"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Intercepted calls</div>
+          <div class="feed-wrap">
+            <table class="feed" id="feed">
+              <thead><tr><th>Time</th><th>App</th><th>Function</th><th>Identifier</th><th>Real → Served</th></tr></thead>
+              <tbody id="feedBody"></tbody>
+            </table>
+            <div class="empty" id="feedEmpty">No calls yet. Launch a protected app from the “Launch &amp; Attach” tab.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- launch -->
+      <section class="view" id="view-launch">
+        <div class="view-head">
+          <div><h1>Launch &amp; Attach</h1>
+          <p class="muted">Start an app under the guard, or attach to one that's already running.</p></div>
+          <label class="wmi-toggle" title="Also spoof values read via WMI (Win32_BIOS, etc.) — client-side">
+            <input type="checkbox" id="wmiToggle" />
+            <span>WMI coverage</span>
+          </label>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">AI CLI agents</div>
+          <div class="cards" id="cliCards"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Detected apps</div>
+          <div class="cards" id="targetCards"></div>
+        </div>
+
+        <div class="two-col">
+          <div class="panel">
+            <div class="panel-title">Launch a custom app</div>
+            <div class="row">
+              <input type="text" id="customExe" class="input" placeholder="Path to .exe" />
+              <button class="btn" id="btnBrowse">Browse…</button>
+              <button class="btn primary" id="btnLaunchExe">Launch</button>
+            </div>
+            <div class="panel-title" style="margin-top:18px">Launch a command (CLI: codex, copilot…)</div>
+            <div class="row">
+              <input type="text" id="customCmd" class="input" placeholder="e.g. codex   (opens in a guarded shell)" />
+              <button class="btn primary" id="btnLaunchCmd">Run</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">Attach to a running process</div>
+            <div class="row">
+              <input type="text" id="procSearch" class="input" placeholder="Filter by name…" />
+              <button class="btn" id="btnRefreshProcs">Refresh</button>
+            </div>
+            <div class="proc-list" id="procList"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Protected sessions</div>
+          <div id="sessionList" class="session-list"></div>
+        </div>
+      </section>
+
+      <!-- ----------------------------------------------------- files -->
+      <section class="view" id="view-files">
+        <div class="view-head"><div><h1>Identity Files</h1>
+          <p class="muted">Apps that cache their device id in a file (VS Code family, Copilot-in-VS Code). Backed up before any change, restorable anytime.</p></div></div>
+        <div class="panel">
+          <div class="row" style="margin-bottom:14px">
+            <button class="btn primary" id="btnApplyFiles">Write active identity to all installed</button>
+            <button class="btn ghost" id="btnRestoreFiles">Restore originals</button>
+          </div>
+          <div id="fileTargets"></div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------ help -->
+      <section class="view" id="view-help">
+        <div class="view-head"><div><h1>How it works</h1></div></div>
+        <div class="panel prose" id="helpBody"></div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast"></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

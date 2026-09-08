@@ -1,0 +1,5 @@
+frida>=17
+pywebview>=6
+pythonnet>=3.0
+# packaging (optional):
+# pyinstaller>=6
