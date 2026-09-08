@@ -18,6 +18,16 @@ you choose* — and stops lying the moment you detach.
 
 ---
 
+## Screenshots
+
+**Identities** — each profile is a self-consistent set of fake hardware IDs; one click generates a fresh one, one click activates it.
+
+![Identities](docs/identities.png)
+
+**Live Monitor** — every hardware-ID call a protected app makes, in real time, with the real value it asked for and the value served back.
+
+![Live Monitor](docs/monitor.png)
+
 ## Why interception instead of a "HWID changer"
 
 Most HWID spoofers permanently rewrite registry keys or use a kernel driver to
@@ -156,3 +166,7 @@ pyinstaller --noconfirm --windowed --name Chameleon ^
 The WebView2 **runtime** must be present on the target machine (it is on
 Windows 11 and up-to-date Windows 10/Server; otherwise ship the Evergreen
 bootstrapper).
+
+## License
+
+[MIT](LICENSE) © mohayo
