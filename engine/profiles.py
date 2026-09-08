@@ -124,6 +124,9 @@ def generate_identity(name: Optional[str] = None, seed: Optional[int] = None) ->
         "machine_guid": _guid(rng, braces=False, upper=False),        # HKLM\...\Cryptography\MachineGuid
         "sqm_machine_id": _guid(rng, braces=True, upper=True),        # HKLM\...\SQMClient\MachineId
         "product_id": _windows_product_id(rng),                       # HKLM\...\CurrentVersion\ProductId
+        "sus_client_id": _guid(rng, braces=False, upper=False),       # HKLM\...\WindowsUpdate\SusClientId
+        "hw_profile_guid": _guid(rng, braces=True, upper=True),       # IDConfigDB\Hardware Profiles\0001
+        "build_guid": _guid(rng, braces=False, upper=False),          # CurrentVersion\BuildGUID
         "computer_name": _computer_name(rng),
         # --- Firmware / SMBIOS ---
         "system_manufacturer": manufacturer,
@@ -261,4 +264,7 @@ class ProfileStore:
             "systemSerial": ident["system_serial"],
             "processorId": ident["processor_id"],
             "diskSerial": ident.get("disk_serial", ident["baseboard_serial"]),
+            "susClientId": ident.get("sus_client_id", ident["machine_guid"]),
+            "hwProfileGuid": ident.get("hw_profile_guid", "{" + ident["system_uuid"] + "}"),
+            "buildGuid": ident.get("build_guid", ident["machine_guid"]),
         }

@@ -52,11 +52,15 @@ function resolve(mod, name) {
   return null;
 }
 
+const attachedAddrs = new Set();
 function hook(mod, name, callbacks) {
   const p = resolve(mod, name);
   if (!p) return false;
+  const key = p.toString();
+  if (attachedAddrs.has(key)) return true;   // same address via another module alias
   try {
     Interceptor.attach(p, callbacks);
+    attachedAddrs.add(key);
     hooked.push(name);
     return true;
   } catch (e) {
@@ -117,6 +121,12 @@ function matchValue(pathLower, valueLower) {
     return { key: 'ProductId', val: CONFIG.productId };
   if (pathLower.indexOf('windows nt\\currentversion') !== -1 && valueLower === 'computername')
     return { key: 'ComputerName', val: CONFIG.computerName };
+  if (pathLower.indexOf('currentversion\\windowsupdate') !== -1 && valueLower === 'susclientid')
+    return { key: 'SusClientId', val: CONFIG.susClientId };
+  if (pathLower.indexOf('idconfigdb\\hardware profiles') !== -1 && valueLower === 'hwprofileguid')
+    return { key: 'HwProfileGuid', val: CONFIG.hwProfileGuid };
+  if (pathLower.indexOf('windows nt\\currentversion') !== -1 && valueLower === 'buildguid')
+    return { key: 'BuildGUID', val: CONFIG.buildGuid };
   return null;
 }
 
@@ -454,11 +464,82 @@ function installComputerNameHooks() {
       report('GetComputerNameA', 'ComputerName', real, name);
     },
   });
-  // NOTE: We deliberately do NOT hook GetComputerNameEx*. Local RPC/COM builds
-  // the binding to the WMI host (\\<name>\root\cimv2) via GetComputerNameEx, so
-  // spoofing it there breaks WMI/DCOM entirely ("Invalid access to memory
-  // location"). Apps still get a spoofed name via GetComputerName (above) and,
-  // for WMI consumers, via Win32_ComputerSystem.Name in the WMI hook below.
+  // GetComputerNameEx is also used by local RPC/COM to bind to the WMI host, and
+  // spoofing it *there* breaks WMI/DCOM. So we hook it but only rewrite when the
+  // immediate caller is NOT a system RPC/COM/WMI module: real application reads
+  // get the fake name, while RPC/WMI internals keep seeing the real one.
+  const SYS_CALLERS = {
+    'rpcrt4.dll': 1, 'combase.dll': 1, 'ole32.dll': 1, 'rpcss.dll': 1, 'sspicli.dll': 1,
+    'secur32.dll': 1, 'wkscli.dll': 1, 'netutils.dll': 1, 'sechost.dll': 1,
+    'wbemprox.dll': 1, 'wbemcomn.dll': 1, 'fastprox.dll': 1, 'wbemsvc.dll': 1, 'wbemcore.dll': 1,
+  };
+  const HOST_FORMATS = { 0: 1, 1: 1, 4: 1, 5: 1 };
+  function callerModule(ret) {
+    try { const m = Process.findModuleByAddress(ret); return m ? m.name.toLowerCase() : null; }
+    catch (e) { return null; }
+  }
+  ['GetComputerNameExW', 'GetComputerNameExA'].forEach(function (name) {
+    const wide = name.endsWith('W');
+    hook('kernel32.dll', name, {
+      onEnter: function (a) {
+        this.nameType = a[0].toInt32();
+        this.buf = a[1]; this.pSize = a[2];
+        this.ret = this.returnAddress;
+        try { this.cap = this.pSize.readU32(); } catch (e) { this.cap = 0; }
+      },
+      onLeave: function (r) {
+        if (r.toInt32() === 0 || this.buf.isNull()) return;
+        if (!HOST_FORMATS[this.nameType]) return;
+        const cm = callerModule(this.ret);
+        if (cm && SYS_CALLERS[cm]) return;         // leave RPC/COM/WMI internals alone
+        let real = null;
+        try { real = wide ? this.buf.readUtf16String() : this.buf.readAnsiString(); } catch (e) {}
+        const val = CONFIG.computerName;
+        if (val.length + 1 > this.cap) return;
+        try {
+          if (wide) this.buf.writeUtf16String(val); else this.buf.writeAnsiString(val);
+          if (!this.pSize.isNull()) this.pSize.writeU32(val.length);
+        } catch (e) { return; }
+        report(name, 'ComputerName', real, val);
+      },
+    });
+  });
+}
+
+/* --------------------------------------------- disk serial (IOCTL) */
+
+function overwriteAsciiInPlace(ptr, maxLen, val) {
+  const bytes = [];
+  for (let i = 0; i < maxLen; i++) bytes.push(i < val.length ? (val.charCodeAt(i) & 0x7F) : 0x30);
+  try { ptr.writeByteArray(bytes); } catch (e) {}
+}
+
+function installDiskHooks() {
+  const IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400;
+  ['kernel32.dll', 'kernelbase.dll'].forEach(function (mod) {
+    hook(mod, 'DeviceIoControl', {
+      onEnter: function (a) {
+        this.ioctl = a[1].toUInt32() >>> 0;
+        this.outBuf = a[4];
+        this.outSize = a[5].toUInt32() >>> 0;
+      },
+      onLeave: function (r) {
+        if (this.ioctl !== IOCTL_STORAGE_QUERY_PROPERTY) return;
+        if (r.toInt32() === 0 || this.outBuf.isNull()) return;
+        try {
+          // STORAGE_DEVICE_DESCRIPTOR.SerialNumberOffset is at byte offset 24
+          const off = this.outBuf.add(24).readU32();
+          if (off === 0 || off === 0xffffffff || off >= this.outSize) return;
+          const sp = this.outBuf.add(off);
+          let real = null;
+          try { real = sp.readAnsiString(); } catch (e) {}
+          if (!real || real.length === 0) return;
+          overwriteAsciiInPlace(sp, real.length, CONFIG.diskSerial);
+          report('DeviceIoControl', 'DiskSerial', real.trim(), CONFIG.diskSerial);
+        } catch (e) {}
+      },
+    });
+  });
 }
 
 /* ------------------------------------------ WMI (client-side COM hooks) */
@@ -692,6 +773,7 @@ function main() {
   try { installMacHooks(); } catch (e) {}
   try { installVolumeHooks(); } catch (e) {}
   try { installComputerNameHooks(); } catch (e) {}
+  try { installDiskHooks(); } catch (e) {}
   try { installWmiClientHooks(); } catch (e) {}
 
   send({ type: 'ready', pid: Process.id, hooked: hooked, profile: CONFIG.profileName });
