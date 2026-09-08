@@ -153,20 +153,38 @@ hw_profile/
 └─ data/                     # profiles/, backups/, state.json  (created at runtime)
 ```
 
-## Packaging to a single .exe (optional)
+## Building the release .exe
+
+A single self-contained `dist\Chameleon.exe` (~52 MB), dead modules excluded and
+compiled with `--optimize 2`:
 
 ```bat
 pip install pyinstaller
-pyinstaller --noconfirm --windowed --name Chameleon ^
+pyinstaller --noconfirm --clean --onefile --windowed --name Chameleon ^
   --add-data "ui;ui" --add-data "engine/agent.js;engine" ^
-  --collect-all frida --collect-all webview --collect-all clr_loader ^
-  app.py
+  --collect-all frida --collect-all pythonnet --collect-all clr_loader --collect-all webview ^
+  --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 ^
+  --exclude-module PySide2 --exclude-module PySide6 --exclude-module PIL ^
+  --exclude-module numpy --exclude-module pandas --exclude-module scipy ^
+  --exclude-module matplotlib --exclude-module IPython --exclude-module pytest ^
+  --exclude-module notebook --exclude-module sqlite3 ^
+  --exclude-module webview.platforms.gtk --exclude-module webview.platforms.qt ^
+  --exclude-module webview.platforms.cocoa --exclude-module webview.platforms.android ^
+  --optimize 2 app.py
 ```
 
-The WebView2 **runtime** must be present on the target machine (it is on
-Windows 11 and up-to-date Windows 10/Server; otherwise ship the Evergreen
-bootstrapper).
+**On the size:** the weight is Frida's native core (`_frida.pyd` is ~112 MB
+uncompressed; PyInstaller's zlib brings the whole app to ~52 MB). UPX is
+intentionally **not** used — it can corrupt Frida's embedded agent and makes
+antivirus false-positives far more likely.
+
+**Two notes for distribution:**
+- The WebView2 **runtime** must be present on the target machine (it is on
+  Windows 11 and up-to-date Windows 10/Server; otherwise ship the Evergreen
+  bootstrapper).
+- Because it bundles Frida and injects into other processes, some antivirus /
+  EDR may flag the exe. Run as Administrator.
 
 ## License
 
-[MIT](LICENSE) © mohayo
+[MIT](LICENSE) (c) mohayo
