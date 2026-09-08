@@ -1,7 +1,7 @@
 "use strict";
 
 let api = null;
-let state = { activeId: null, enabled: false, profiles: [], view: "identities" };
+let state = { activeId: null, enabled: false, profiles: [], view: "identities", live: null };
 
 /* --------------------------------------------------------------- helpers */
 const $ = (s, r = document) => r.querySelector(s);
@@ -41,6 +41,9 @@ function switchView(name) {
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
   if (name === "launch") { loadTargets(); refreshProcs(); }
   if (name === "files") loadFiles();
+  // paint the conditional panels straight away instead of waiting for the next poll
+  if (name === "monitor") renderErrors(state.live);
+  if (name === "launch") renderElevation(state.live);
 }
 
 /* --------------------------------------------------------------- header */
@@ -129,6 +132,30 @@ function barlist(obj) {
       <span class="num">${v}</span></div>`).join("");
 }
 
+/* -------------------------------------------------------- engine errors */
+/* Failures reported by the engine (attach denied, injection failed, …).
+   Renders nothing at all while live.errors is empty. */
+function renderErrors(live) {
+  const panel = $("#errPanel");
+  if (!panel) return;
+  const errs = (live && live.errors) || [];
+  if (!errs.length) { panel.innerHTML = ""; panel.hidden = true; return; }
+  const rows = errs.map((e) => `<div class="erow">
+      <span class="ets">${e.ts ? ago(e.ts) : "—"}</span>
+      <span class="eapp" title="${esc(e.app)}">${esc(e.app || "—")}${e.pid ? `<span class="epid">pid ${esc(e.pid)}</span>` : ""}</span>
+      <span class="emsg">${esc(e.msg)}</span>
+    </div>`).join("");
+  panel.innerHTML = `<div class="panel-title bad">Engine errors <span class="badge">${errs.length}</span></div>
+    <div class="elist">${rows}</div>${elevationHint(live)}`;
+  panel.hidden = false;
+}
+
+/* One-line version of the elevation notice, shown only when we know we are not elevated. */
+function elevationHint(live) {
+  if (!live || live.admin !== false) return "";
+  return `<div class="enote">Chameleon is not running as Administrator, so Windows refuses to attach to apps that are already running. Launch the app from the “Launch &amp; Attach” tab instead, or restart Chameleon as Administrator.</div>`;
+}
+
 /* ------------------------------------------------------------- sessions */
 function renderSessions(live) {
   const list = $("#sessionList");
@@ -142,6 +169,18 @@ function renderSessions(live) {
     </div>
     ${x.status === "active" ? `<button class="btn sm ghost" data-stop="${x.pid}">Detach</button>` : ""}
   </div>`).join("");
+}
+
+/* Elevation notice on the Launch & Attach tab. Hidden unless live.admin === false,
+   so an unknown/missing admin flag changes nothing. */
+function renderElevation(live) {
+  const box = $("#elevNotice");
+  if (!box) return;
+  if (!live || live.admin !== false) { box.innerHTML = ""; box.hidden = true; return; }
+  box.innerHTML = `<div class="panel-title warn">Not running as Administrator</div>
+    <p class="muted">Attaching to an app that is <strong>already running</strong> is unavailable — Windows will not let Chameleon open another process for injection without elevation, so “Attach” and the auto-attach watcher fail.</p>
+    <p class="muted" style="margin-top:6px">Launching an app <strong>through Chameleon</strong> still works and is fully protected. To attach to running apps, close Chameleon and start it again with <strong>Run as administrator</strong>.</p>`;
+  box.hidden = false;
 }
 
 /* ------------------------------------------------------- launch/attach */
@@ -221,14 +260,28 @@ function renderFiles(items) {
 
 /* --------------------------------------------------------------- verify */
 function renderVerify(r) {
-  const rows = r.checks.map((c) => `<div class="vrow ${c.pass ? "ok" : "bad"}">
-    <span class="vmark">${c.pass ? "✓" : "✗"}</span>
-    <span class="vname">${esc(c.name)}</span>
-    <span class="vval">${c.pass ? esc(c.expected)
-      : esc(c.error ? ("error: " + c.error) : ("real value leaked — " + c.snippet))}</span></div>`).join("");
+  const groups = [];
+  r.checks.forEach((c) => {
+    const g = c.group || "";
+    const last = groups[groups.length - 1];
+    if (last && last.name === g) last.rows.push(c);
+    else groups.push({ name: g, rows: [c] });
+  });
+  const html = groups.map((g) => {
+    const passed = g.rows.filter((c) => c.pass).length;
+    const rows = g.rows.map((c) => `<div class="vrow ${c.pass ? "ok" : "bad"}">
+      <span class="vmark">${c.pass ? "✓" : "✗"}</span>
+      <span class="vname">${esc(c.name)}</span>
+      <span class="vval">${c.pass ? esc(c.expected)
+        : esc(c.error ? ("error: " + c.error) : ("real value leaked — " + c.snippet))}</span></div>`).join("");
+    return `<div class="vgroup"><span>${esc(g.name)}</span>
+      <span class="vgcount ${passed === g.rows.length ? "ok" : "bad"}">${passed}/${g.rows.length}</span></div>` + rows;
+  }).join("");
   const all = r.passed === r.total;
+  const hint = (!all && r.wmi === false)
+    ? ` <span class="muted">— WMI / CIM coverage is off; turn it on in Launch &amp; Attach and re-run.</span>` : "";
   $("#verifyResults").innerHTML =
-    `<div class="vsum">${r.passed}/${r.total} identifiers served the fake value${all ? " — fully covered ✅" : ""}</div>` + rows;
+    `<div class="vsum">${r.passed}/${r.total} identifiers served the fake value${all ? " — fully covered ✅" : ""}${hint}</div>` + html;
 }
 
 /* -------------------------------------------------------------- polling */
@@ -236,6 +289,7 @@ async function pollLive() {
   if (!api) return;
   try {
     const live = await api.get_live();
+    state.live = live;
     state.enabled = live.enabled;
     state.activeId = live.active_id;
     state.activeName = live.active_name;
@@ -248,8 +302,8 @@ async function pollLive() {
     else if (active > 0) { ms.textContent = `Protecting ${active} app${active > 1 ? "s" : ""}`; mh.textContent = `${live.total} calls served`; }
     else { ms.textContent = "Armed"; mh.textContent = "launch or attach an app"; }
 
-    if (state.view === "monitor") renderMonitor(live);
-    if (state.view === "launch") renderSessions(live);
+    if (state.view === "monitor") { renderMonitor(live); renderErrors(live); }
+    if (state.view === "launch") { renderSessions(live); renderElevation(live); }
   } catch (e) { /* window closing */ }
 }
 
@@ -272,7 +326,7 @@ function wire() {
 
   $("#wmiToggle").addEventListener("change", async (e) => {
     await api.set_wmi_coverage(e.target.checked);
-    toast(e.target.checked ? "WMI coverage on (applies to next launch)" : "WMI coverage off", "ok");
+    toast(e.target.checked ? "WMI / CIM coverage on (applies to next launch)" : "WMI / CIM coverage off", "ok");
   });
 
   $("#btnVerify").addEventListener("click", async () => {
@@ -379,14 +433,17 @@ function renderHelp() {
       <li><code>GetAdaptersAddresses / GetAdaptersInfo</code> → <strong>MAC</strong> addresses</li>
       <li><code>GetVolumeInformation</code> → <strong>volume serial</strong></li>
       <li><code>GetComputerName</code> → <strong>hostname</strong></li>
-      <li><strong>WMI</strong> (client-side COM): <code>Win32_BIOS</code>, <code>ComputerSystemProduct</code>, <code>BaseBoard</code>, <code>Processor</code>, <code>DiskDrive</code>, <code>NetworkAdapter</code>, <code>ComputerSystem</code> → serials, UUID, ProcessorId, MAC, hostname</li>
+      <li><code>DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY)</code> → <strong>physical disk serial</strong></li>
+      <li><strong>WMI</strong> (client-side COM): <code>Win32_BIOS</code>, <code>ComputerSystemProduct</code>, <code>BaseBoard</code>, <code>SystemEnclosure</code>, <code>Processor</code>, <code>DiskDrive</code>, <code>NetworkAdapter(Configuration)</code>, <code>LogicalDisk</code>, <code>Volume</code>, <code>ComputerSystem</code> → serials, UUID, ProcessorId, MAC, volume serial, hostname</li>
+      <li><strong>MI / CIM</strong> (same COM layer, async sinks): <code>Get-CimInstance</code>, <code>Get-PhysicalDisk</code>, <code>Get-Disk</code>, <code>Get-NetAdapter</code> and anything else on <code>mi.dll</code> → the same identifiers, plus <code>MSFT_PhysicalDisk</code> serial/UniqueId and <code>MSFT_NetAdapter</code> addresses</li>
     </ul>
     <h3>Identity Files</h3>
     <p>Some apps cache their id in a file instead of re-reading it. VS Code, its forks, and Copilot-in-VS-Code keep telemetry ids in <code>storage.json</code>. The Identity Files tab backs that file up and writes your active identity's ids into it, reversibly.</p>
-    <h3>WMI coverage</h3>
-    <p>The WMI provider host (<code>WmiPrvSE.exe</code>) runs as NETWORK SERVICE and can't be injected reliably, so WMI is intercepted <strong>client-side</strong> instead: when a protected app runs a WMI query, results are unmarshaled into its own process and read via COM, which is hooked. This covers the classic WMI stack — <code>wmic.exe</code>, .NET <code>System.Management</code>, PowerShell <code>Get-WmiObject</code>, and Node libraries that shell out to <code>wmic</code>. Toggle it in the Launch tab (applies to the next launch).</p>
+    <h3>WMI &amp; MI / CIM coverage</h3>
+    <p>The WMI provider host (<code>WmiPrvSE.exe</code>) runs as NETWORK SERVICE and can't be injected reliably, so both management stacks are intercepted <strong>client-side</strong> instead: when a protected app runs a query, the results are unmarshaled into its own process and read via COM, which is hooked.</p>
+    <p>That single hook point covers <strong>both</strong> stacks, because locally <code>mi.dll</code> does not invent its own transport — it loads <code>wmidcom.dll</code>, an ordinary DCOM WMI client that uses the <em>asynchronous</em> entry points and receives objects through an <code>IWbemObjectSink</code>. So <code>wmic</code>, .NET <code>System.Management</code>, <code>Get-WmiObject</code> <em>and</em> <code>Get-CimInstance</code>, <code>Get-PhysicalDisk</code>, <code>Get-NetAdapter</code> all end up reading the same rewritten objects. Toggle it in the Launch tab (applies to the next launch).</p>
     <h3>Honest limitations</h3>
-    <div class="note">The newer <strong>MI / CIM</strong> stack (<code>Get-CimInstance</code>) uses a different API than classic WMI and is not rewritten. Hostname is spoofed via <code>GetComputerName</code> and WMI, but not <code>GetComputerNameEx</code> (spoofing it there breaks local RPC/DCOM). Firmware read via <code>GetSystemFirmwareTable</code> is covered in-process.</div>
+    <div class="note">MI over <strong>WSMan</strong> (an explicit <code>New-CimSession</code> to a host name, rather than the default local session) leaves the machine and isn't intercepted. Per-adapter GUIDs (<code>Win32_NetworkAdapter.GUID</code>, <code>MSFT_NetAdapter.InterfaceGuid</code>) are left alone — they key the networking stack, and rewriting them breaks it. Hostname is spoofed via <code>GetComputerName</code>, <code>GetComputerNameEx</code> (caller-guarded so local RPC/DCOM keeps working) and both management stacks. Firmware read via <code>GetSystemFirmwareTable</code> is covered in-process.</div>
     <p class="muted">This tool is for protecting your own privacy on your own machine. Rotating ids can log you out of apps or affect software licenses tied to hardware.</p>`;
 }
 

@@ -72,6 +72,7 @@
           <button class="btn ghost" id="btnResetStats">Reset</button>
         </div>
         <div class="stat-row" id="statRow"></div>
+        <div class="panel bad" id="errPanel" hidden></div>
         <div class="monitor-grid">
           <div class="panel">
             <div class="panel-title">By function</div>
@@ -99,11 +100,13 @@
         <div class="view-head">
           <div><h1>Launch &amp; Attach</h1>
           <p class="muted">Start an app under the guard, or attach to one that's already running.</p></div>
-          <label class="wmi-toggle" title="Also spoof values read via WMI (Win32_BIOS, etc.) — client-side">
+          <label class="wmi-toggle" title="Also spoof values read via WMI and MI/CIM (Win32_BIOS, Get-CimInstance, Get-PhysicalDisk, …) — client-side">
             <input type="checkbox" id="wmiToggle" />
-            <span>WMI coverage</span>
+            <span>WMI / CIM coverage</span>
           </label>
         </div>
+
+        <div class="panel warn" id="elevNotice" hidden></div>
 
         <div class="panel">
           <div class="panel-title">AI CLI agents</div>

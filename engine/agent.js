@@ -542,22 +542,41 @@ function installDiskHooks() {
   });
 }
 
-/* ------------------------------------------ WMI (client-side COM hooks) */
-// WmiPrvSE.exe can't be injected reliably (it runs as NETWORK SERVICE), so we
-// intercept WMI *in the client*: when the app runs a query, result objects are
-// unmarshaled into its own process and it reads properties via
-// IWbemClassObject::Get. We walk the COM chain from CoCreateInstance(WbemLocator)
-// to reach that Get and rewrite sensitive property values in place. Covers the
-// classic WMI stack (wmic.exe, .NET System.Management, Get-WmiObject, Node libs
-// that shell out to wmic). The newer MI/CIM stack (Get-CimInstance) is separate.
+/* -------------------------- WMI + MI/CIM (client-side COM hooks) */
+// WmiPrvSE.exe can't be injected reliably (it runs as NETWORK SERVICE), so both
+// management stacks are intercepted *in the client*:
+//
+//   * Classic WMI  -- wmic.exe, .NET System.Management, Get-WmiObject, Node libs
+//     that shell out to wmic. The app calls IWbemServices::ExecQuery /
+//     CreateInstanceEnum / GetObject and reads properties off the returned
+//     IWbemClassObject.
+//   * MI / CIM     -- Get-CimInstance, Get-PhysicalDisk, Get-NetAdapter and any
+//     app on the newer MI API (mi.dll). Locally, mi.dll does NOT invent its own
+//     transport: it loads wmidcom.dll, which is an ordinary DCOM WMI client
+//     (CLSID_WbemLocator -> IWbemLocator::ConnectServer -> IWbemServices) that
+//     uses the *asynchronous* entry points and receives results through an
+//     IWbemObjectSink. Results are unmarshaled into the app's own process as
+//     IWbemClassObject, exactly like classic WMI, and wmidcom then reads them
+//     with IWbemClassObject::Get/Next to build each MI_Instance.
+//
+// So both stacks funnel through the same two COM methods, and hooking those --
+// plus the async sinks that deliver MI's objects -- covers them together. This
+// deliberately avoids hooking mi.dll's own function tables, whose in-memory
+// layout is build-specific; every interface used here is frozen COM ABI.
 
 const PTR = Process.pointerSize;
 const CLSID_WbemLocator = [0x11, 0xf8, 0x90, 0x45, 0x3a, 0x1d, 0xd0, 0x11,
                            0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24];
+const VT_BSTR = 8;
+const VT_ARRAY = 0x2000;
+// Win32_Volume.SerialNumber is a uint32 rather than a string; WMI hands those
+// back as VT_I4/VT_UI4 (and occasionally VT_INT/VT_UINT).
+const VT_NUMERIC = { 3: 1, 19: 1, 22: 1, 23: 1 };
 const vtSeen = new Set();      // hooked vtable-method addresses (dedupe)
-const classMap = {};           // IWbemClassObject ptr -> lowercased __CLASS
-let wmiGuard = false;          // suppress our own Get hook during __CLASS lookup
+const guardTids = new Set();   // threads currently inside our own COM call
 let OLE = null;
+let CLASS_BSTR = null;         // cached BSTR("__CLASS")
+let REAL_HOST = null;          // real machine name, captured before we hook it
 
 function ole() {
   if (OLE) return OLE;
@@ -572,6 +591,11 @@ function ole() {
   return OLE;
 }
 
+function bstr(s) {
+  const o = ole();
+  return o.alloc ? o.alloc(Memory.allocUtf16String(s)) : null;
+}
+
 function guidEq(p, bytes) {
   try {
     const b = new Uint8Array(p.readByteArray(16));
@@ -580,33 +604,166 @@ function guidEq(p, bytes) {
   } catch (e) { return false; }
 }
 
+/* -- the real machine name, read once before installComputerNameHooks runs -- */
+
+function captureRealHost() {
+  try {
+    const p = resolve('kernel32.dll', 'GetComputerNameW');
+    if (!p) return;
+    const fn = new NativeFunction(p, 'int', ['pointer', 'pointer']);
+    const buf = Memory.alloc(128);
+    const cch = Memory.alloc(4);
+    cch.writeU32(64);
+    if (fn(buf, cch)) REAL_HOST = buf.readUtf16String();
+  } catch (e) {}
+}
+
+function replaceCI(s, find, repl) {
+  if (!s || !find) return s;
+  const ls = s.toLowerCase(), lf = find.toLowerCase();
+  let out = '', i = 0;
+  for (;;) {
+    const j = ls.indexOf(lf, i);
+    if (j < 0) return out + s.slice(i);
+    out += s.slice(i, j) + repl;
+    i = j + lf.length;
+  }
+}
+
+// real host -> fake host, for values flowing out to the app.
+function hostOut(s) {
+  if (!s || !REAL_HOST || !CONFIG.computerName) return s;
+  return replaceCI(s, REAL_HOST, CONFIG.computerName);
+}
+// fake host -> real host, for object paths / queries flowing back into WMI.
+function hostIn(s) {
+  if (!s || !CONFIG.computerName) return s;
+  return replaceCI(s, CONFIG.computerName, REAL_HOST || '.');
+}
+function isRealHost(s) {
+  return !!(s && REAL_HOST && s.toLowerCase() === REAL_HOST.toLowerCase());
+}
+
+/* ------------------------------------------------- value formatting */
+
 function macColon() {
-  return CONFIG.mac.map(function (x) { return ('0' + (x & 0xff).toString(16)).slice(-2); }).join(':').toUpperCase();
+  return CONFIG.mac.slice(0, 6).map(function (x) {
+    return ('0' + (x & 0xff).toString(16)).slice(-2);
+  }).join(':').toUpperCase();
+}
+// "AABBCCDDEEFF", "AA:BB:CC:DD:EE:FF" or "AA-BB-CC-DD-EE-FF". These property
+// names are also used by CIM classes for values that are not MAC addresses.
+function looksLikeMac(s) {
+  if (typeof s !== 'string') return false;
+  if (s.length !== 12 && s.length !== 17) return false;
+  return /^[0-9A-Fa-f]{12}$/.test(s.split(':').join('').split('-').join(''));
+}
+// Mimic however the real value was punctuated: "AA:BB:..", "AA-BB-..", "AABB..".
+function macLike(real) {
+  const h = macColon().split(':');
+  if (typeof real === 'string') {
+    if (real.indexOf(':') >= 0) return h.join(':');
+    if (real.indexOf('-') >= 0) return h.join('-');
+    if (/^[0-9A-Fa-f]{12}$/.test(real)) return h.join('');
+  }
+  return h.join(':');
 }
 function volPlain() {
   return ((CONFIG.volumeSerial >>> 0).toString(16).toUpperCase()).padStart(8, '0');
 }
 
-function wmiValueFor(prop, cls) {
-  prop = (prop || '').toLowerCase();
-  cls = (cls || '').toLowerCase();
+// Stable per-profile pseudonym for an opaque hardware id (MSFT_PhysicalDisk
+// UniqueId is an EUI/NAA string, one per disk). Deriving it from the real value
+// keeps two disks distinct instead of collapsing them onto one id.
+function h32(s, seed) {
+  let h = seed >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i) & 0xff;
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return ('00000000' + h.toString(16).toUpperCase()).slice(-8);
+}
+function pseudoHex(real) {
+  const salt = (CONFIG.machineGuid || CONFIG.profileId || '') + '|' + real;
+  return h32(salt, 0x811c9dc5) + h32(salt, 0x01000193);
+}
+function fakeUniqueId(real) {
+  if (!real) return null;
+  const m = /^([A-Za-z]+\.)(.+)$/.exec(real);       // "eui.<hex>", "naa.<hex>"
+  if (m) return m[1] + pseudoHex(real).substr(0, Math.min(m[2].length, 16));
+  if (/^[0-9A-Fa-f]{8,}$/.test(real)) return pseudoHex(real).substr(0, Math.min(real.length, 16));
+  return CONFIG.diskSerial;
+}
+
+/* ------------------------------------------------- property mapping */
+
+// Fast pre-filter: only these property names can ever be rewritten, so the vast
+// majority of property reads cost one lookup and nothing else.
+const SENSITIVE = {
+  'uuid': 1, 'processorid': 1, 'identifyingnumber': 1, 'serialnumber': 1,
+  'macaddress': 1, 'permanentaddress': 1, 'networkaddresses': 1,
+  'volumeserialnumber': 1,
+  'dnshostname': 1, 'name': 1, 'caption': 1, 'csname': 1, 'pscomputername': 1,
+  'uniqueid': 1, 'objectid': 1, '__server': 1, '__path': 1,
+};
+
+// Only 'serialnumber' and 'uniqueid' actually need the object's class; the rest
+// are decided from the property name and the real value alone.
+function serialForClass(cls) {
+  if (cls.indexOf('baseboard') >= 0 || cls.indexOf('_card') >= 0) return CONFIG.baseboardSerial;
+  if (cls.indexOf('enclosure') >= 0 || cls.indexOf('chassis') >= 0) return CONFIG.chassisSerial;
+  if (cls.indexOf('disk') >= 0 || cls.indexOf('physicalmedia') >= 0 ||
+      cls.indexOf('storage') >= 0 || cls.indexOf('volume') >= 0) return CONFIG.diskSerial;
+  return CONFIG.biosSerial;                       // BIOS, and anything unknown
+}
+
+function wmiValueFor(prop, obj, real) {
   switch (prop) {
     case 'uuid': return CONFIG.systemUuid;
     case 'processorid': return CONFIG.processorId;
-    case 'macaddress': return macColon();
     case 'identifyingnumber': return CONFIG.systemSerial;
     case 'volumeserialnumber': return volPlain();
-    case 'serialnumber':
-      if (cls.indexOf('baseboard') >= 0) return CONFIG.baseboardSerial;
-      if (cls.indexOf('enclosure') >= 0 || cls.indexOf('chassis') >= 0) return CONFIG.chassisSerial;
-      if (cls.indexOf('diskdrive') >= 0 || cls.indexOf('physicalmedia') >= 0) return CONFIG.diskSerial;
-      return CONFIG.biosSerial;
     case 'dnshostname': return CONFIG.computerName;
-    case 'name': return cls.indexOf('computersystem') >= 0 ? CONFIG.computerName : null;
-    case 'csname': return cls.indexOf('operatingsystem') >= 0 ? CONFIG.computerName : null;
+    case '__server': return CONFIG.computerName;
+    // MACAddress (Win32_*), PermanentAddress / NetworkAddresses[] (MSFT_NetAdapter,
+    // which is what Get-NetAdapter reads). Shape-checked, because CIM classes
+    // also use these names for things that are not MACs.
+    case 'macaddress':
+    case 'permanentaddress':
+    case 'networkaddresses':
+      return looksLikeMac(real) ? macLike(real) : null;
+    // Any property whose value *is* the machine name: Win32_ComputerSystem.Name
+    // and .Caption, Win32_OperatingSystem.CSName, ... This deliberately leaves
+    // Win32_ComputerSystemProduct.Name (the model) alone.
+    case 'name':
+    case 'caption':
+    case 'csname':
+    case 'pscomputername': {
+      if (isRealHost(real)) return CONFIG.computerName;
+      if (REAL_HOST) return null;                 // known host, not a match
+      const cls = classOf(obj) || '';             // fallback if capture failed
+      if (prop === 'csname' && cls.indexOf('operatingsystem') >= 0) return CONFIG.computerName;
+      if (prop !== 'csname' && cls.indexOf('computersystem') >= 0 &&
+          cls.indexOf('product') < 0) return CONFIG.computerName;
+      return null;
+    }
+    // Object paths carry "\\<host>\root\..."; rewrite only the host part.
+    case '__path':
+    case 'objectid': {
+      const s = hostOut(real);
+      return (s && s !== real) ? s : null;
+    }
+    case 'serialnumber': return serialForClass(classOf(obj) || '');
+    case 'uniqueid': {
+      const cls = classOf(obj) || '';
+      if (cls.indexOf('disk') < 0 && cls.indexOf('physicalmedia') < 0) return null;
+      return fakeUniqueId(real);
+    }
     default: return null;
   }
 }
+
+/* --------------------------------------------------- COM plumbing */
 
 function hookVtableMethod(obj, index, label, cbs) {
   try {
@@ -619,83 +776,185 @@ function hookVtableMethod(obj, index, label, cbs) {
   } catch (e) {}
 }
 
-function getFnPtr(obj) {
-  try { return obj.readPointer().add(4 * PTR).readPointer(); } catch (e) { return null; }
-}
-
+// IWbemClassObject::Get, used both to serve the app and (re-entrantly, under a
+// guard) to ask an object for its own __CLASS.
 function classOf(obj) {
+  const tid = Process.getCurrentThreadId();
   try {
-    const o = ole();
-    const gfn = getFnPtr(obj);
-    if (!o.alloc || !gfn) return null;
-    const nf = new NativeFunction(gfn, 'int', ['pointer', 'pointer', 'int', 'pointer', 'pointer', 'pointer']);
-    const name = o.alloc(Memory.allocUtf16String('__CLASS'));
+    const fn = obj.readPointer().add(4 * PTR).readPointer();
+    if (fn.isNull()) return null;
+    if (!CLASS_BSTR) CLASS_BSTR = bstr('__CLASS');
+    if (!CLASS_BSTR) return null;
+    const nf = new NativeFunction(fn, 'int', ['pointer', 'pointer', 'int', 'pointer', 'pointer', 'pointer']);
     const v = Memory.alloc(24);
     v.writeByteArray([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    wmiGuard = true;
-    const hr = nf(obj, name, 0, v, ptr(0), ptr(0));
-    wmiGuard = false;
+    guardTids.add(tid);
+    const hr = nf(obj, CLASS_BSTR, 0, v, ptr(0), ptr(0));
+    guardTids.delete(tid);
     let cls = null;
-    if (hr === 0 && v.readU16() === 8) {         // VT_BSTR
-      const bstr = v.add(8).readPointer();
-      if (!bstr.isNull()) cls = bstr.readUtf16String();
+    if (hr === 0 && v.readU16() === VT_BSTR) {
+      const b = v.add(8).readPointer();
+      if (!b.isNull()) cls = b.readUtf16String();
     }
-    if (o.clear) o.clear(v);
-    if (o.free) o.free(name);
-    return cls;
-  } catch (e) { wmiGuard = false; return null; }
+    if (ole().clear) ole().clear(v);
+    return cls ? cls.toLowerCase() : null;
+  } catch (e) { guardTids.delete(tid); return null; }
+}
+
+// Swap a BSTR held in a VARIANT/SAFEARRAY slot. The caller owns the string and
+// will SysFreeString it, so ownership stays correct.
+function swapBstr(slot, val) {
+  const o = ole();
+  if (!o.alloc) return false;
+  const nb = o.alloc(Memory.allocUtf16String(val));
+  if (nb.isNull()) return false;
+  const old = slot.readPointer();
+  slot.writePointer(nb);
+  if (!old.isNull() && o.free) o.free(old);
+  return true;
 }
 
 function rewriteVariant(pVal, prop, self, label) {
   try {
     if (!prop || pVal.isNull()) return;
-    const cls = classMap[self.toString()] || '';
-    const val = wmiValueFor(prop, cls);
-    if (val === null) return;
-    if (pVal.readU16() !== 8) return;              // only rewrite string (BSTR) values
-    const o = ole();
-    if (!o.alloc) return;
-    const oldb = pVal.add(8).readPointer();
-    pVal.add(8).writePointer(o.alloc(Memory.allocUtf16String(val)));
-    if (!oldb.isNull() && o.free) o.free(oldb);
-    report(label, prop + (cls ? ' (' + cls + ')' : ''), null, val);
+    const p = prop.toLowerCase();
+    if (!SENSITIVE[p]) return;
+    const vt = pVal.readU16();
+
+    if (vt === VT_BSTR) {
+      const slot = pVal.add(8);
+      const cur = slot.readPointer();
+      const real = cur.isNull() ? null : cur.readUtf16String();
+      const val = wmiValueFor(p, self, real);
+      if (val === null || val === real) return;
+      if (!swapBstr(slot, val)) return;
+      report(label, prop, real, val);
+      return;
+    }
+
+    if (VT_NUMERIC[vt]) {
+      // The only numeric identifier WMI/CIM exposes is the volume serial.
+      if (p !== 'serialnumber') return;
+      if ((classOf(self) || '').indexOf('volume') < 0) return;
+      const slot = pVal.add(8);
+      const real = slot.readU32() >>> 0;
+      const val = CONFIG.volumeSerial >>> 0;
+      if (real === val) return;
+      slot.writeU32(val);
+      report(label, prop, fmtSerial(real), fmtSerial(val));
+      return;
+    }
+
+    if (vt === (VT_BSTR | VT_ARRAY)) {             // string[] properties
+      const sa = pVal.add(8).readPointer();
+      if (sa.isNull() || sa.readU16() !== 1) return;   // 1-dimensional only
+      const data = sa.add(16).readPointer();
+      const n = sa.add(24).readU32();
+      if (data.isNull() || n > 4096) return;
+      for (let i = 0; i < n; i++) {
+        const slot = data.add(i * PTR);
+        const cur = slot.readPointer();
+        const real = cur.isNull() ? null : cur.readUtf16String();
+        const val = wmiValueFor(p, self, real);
+        if (val === null || val === real) continue;
+        if (swapBstr(slot, val)) report(label, prop, real, val);
+      }
+    }
   } catch (e) {}
+}
+
+// mi.dll's local transport is wmidcom.dll, and miutils.dll is the helper that
+// turns each IWbemClassObject into an MI_Instance -- so a read coming from
+// either is a CIM/MI read rather than a classic WMI one. Only computed when
+// we are about to rewrite, so it costs nothing on ordinary property reads.
+const MI_MODULES = { 'miutils.dll': 1, 'wmidcom.dll': 1, 'mi.dll': 1 };
+
+function stackTag(ret) {
+  try {
+    const m = Process.findModuleByAddress(ret);
+    if (m && MI_MODULES[m.name.toLowerCase()]) return 'MI/CIM';
+  } catch (e) {}
+  return 'WMI';
 }
 
 function registerObject(obj) {
   try {
     if (obj.isNull()) return;
-    // Path A: app reads a named property directly -> IWbemClassObject::Get (idx 4)
+    // Path A: app reads a named property -> IWbemClassObject::Get (idx 4)
     hookVtableMethod(obj, 4, 'IWbemClassObject::Get', {
-      onEnter: function (a) { this.self = a[0]; this.pName = a[1]; this.pVal = a[3]; },
+      onEnter: function (a) { this.self = a[0]; this.pName = a[1]; this.pVal = a[3]; this.ret = this.returnAddress; },
       onLeave: function (r) {
-        if (wmiGuard || r.toInt32() !== 0) return;
+        if (r.toInt32() !== 0) return;
+        if (guardTids.has(Process.getCurrentThreadId())) return;
         let prop = null;
         try { prop = this.pName.readUtf16String(); } catch (e) {}
-        rewriteVariant(this.pVal, prop, this.self, 'WMI::Get');
+        if (!prop || !SENSITIVE[prop.toLowerCase()]) return;
+        rewriteVariant(this.pVal, prop, this.self, stackTag(this.ret) + '::Get');
       },
     });
     // Path B: app enumerates properties -> IWbemClassObject::Next (idx 9),
-    // which returns each property's name (*strName) and value (*pVal). This is
-    // how wmic.exe reads values.
+    // returning each property's name (*strName) and value (*pVal). This is how
+    // wmic.exe reads values and how wmidcom builds an MI_Instance.
     hookVtableMethod(obj, 9, 'IWbemClassObject::Next(prop)', {
-      onEnter: function (a) { this.self = a[0]; this.pName = a[2]; this.pVal = a[3]; },
+      onEnter: function (a) { this.self = a[0]; this.pName = a[2]; this.pVal = a[3]; this.ret = this.returnAddress; },
       onLeave: function (r) {
-        if (wmiGuard || r.toInt32() !== 0) return;
+        if (r.toInt32() !== 0) return;
+        if (guardTids.has(Process.getCurrentThreadId())) return;
         let prop = null;
         try { const b = this.pName.readPointer(); if (!b.isNull()) prop = b.readUtf16String(); } catch (e) {}
-        rewriteVariant(this.pVal, prop, this.self, 'WMI::Enum');
+        if (!prop || !SENSITIVE[prop.toLowerCase()]) return;
+        rewriteVariant(this.pVal, prop, this.self, stackTag(this.ret) + '::Enum');
       },
     });
-    const cls = classOf(obj);
-    if (cls) classMap[obj.toString()] = cls.toLowerCase();
   } catch (e) {}
+}
+
+// Async results (the path MI/CIM uses) arrive as IWbemObjectSink::Indicate(
+// LONG count, IWbemClassObject** objs). Hook on ENTER so the object hooks are
+// in place before the sink reads anything.
+function hookSink(p) {
+  try {
+    if (p.isNull()) return;
+    hookVtableMethod(p, 3, 'IWbemObjectSink::Indicate', {
+      onEnter: function (a) {
+        try {
+          const n = a[1].toInt32();
+          const arr = a[2];
+          if (arr.isNull() || n <= 0 || n > 4096) return;
+          for (let i = 0; i < n; i++) {
+            const o = arr.add(i * PTR).readPointer();
+            if (!o.isNull()) { registerObject(o); break; }
+          }
+        } catch (e) {}
+      },
+    });
+  } catch (e) {}
+}
+
+// An app that read the fake hostname may hand it back to WMI as a server name,
+// object path or query filter. Swap it for the real one on the way in so the
+// call still resolves, then release our temporary string on return.
+function deFakeArg(state, a, idx) {
+  try {
+    const p = a[idx];
+    if (p.isNull() || !CONFIG.computerName) return;
+    const s = p.readUtf16String();
+    if (!s || s.toLowerCase().indexOf(CONFIG.computerName.toLowerCase()) < 0) return;
+    const nb = bstr(hostIn(s));
+    if (!nb || nb.isNull()) return;
+    a[idx] = nb;
+    state.tmpBstr = nb;
+  } catch (e) {}
+}
+function freeTmp(state) {
+  try { if (state.tmpBstr && ole().free) ole().free(state.tmpBstr); } catch (e) {}
+  state.tmpBstr = null;
 }
 
 function installWmiClientHooks() {
   if (!CONFIG.wmi) return;
 
-  const nextCbs = {
+  const nextCbs = {                    // IEnumWbemClassObject::Next
     onEnter: function (a) { this.ap = a[3]; this.pnum = a[4]; },
     onLeave: function (r) {
       try {
@@ -708,45 +967,59 @@ function installWmiClientHooks() {
       } catch (e) {}
     },
   };
+
+  // -- synchronous entry points (classic WMI) --
   const execQueryCbs = {
-    onEnter: function (a) { this.pp = a[5]; },
-    onLeave: function (r) { if (r.toInt32() === 0) { try { hookVtableMethod(this.pp.readPointer(), 4, 'IEnumWbemClassObject::Next', nextCbs); } catch (e) {} } },
+    onEnter: function (a) { this.pp = a[5]; deFakeArg(this, a, 2); },
+    onLeave: function (r) {
+      freeTmp(this);
+      if (r.toInt32() === 0) { try { hookVtableMethod(this.pp.readPointer(), 4, 'IEnumWbemClassObject::Next', nextCbs); } catch (e) {} }
+    },
   };
   const createEnumCbs = {
     onEnter: function (a) { this.pp = a[4]; },
     onLeave: function (r) { if (r.toInt32() === 0) { try { hookVtableMethod(this.pp.readPointer(), 4, 'IEnumWbemClassObject::Next', nextCbs); } catch (e) {} } },
   };
   const getObjectCbs = {
-    onEnter: function (a) { this.pp = a[4]; },
-    onLeave: function (r) { if (r.toInt32() === 0) { try { registerObject(this.pp.readPointer()); } catch (e) {} } },
+    onEnter: function (a) { this.pp = a[4]; deFakeArg(this, a, 1); },
+    onLeave: function (r) {
+      freeTmp(this);
+      if (r.toInt32() === 0) { try { registerObject(this.pp.readPointer()); } catch (e) {} }
+    },
   };
+
+  // -- asynchronous entry points (the ones mi.dll/wmidcom drives) --
+  const execQueryAsyncCbs = {
+    onEnter: function (a) { deFakeArg(this, a, 2); hookSink(a[5]); },
+    onLeave: function () { freeTmp(this); },
+  };
+  const createEnumAsyncCbs = {
+    onEnter: function (a) { hookSink(a[4]); },
+  };
+  const getObjectAsyncCbs = {
+    onEnter: function (a) { deFakeArg(this, a, 1); hookSink(a[4]); },
+    onLeave: function () { freeTmp(this); },
+  };
+
   const connectCbs = {
     onEnter: function (a) {
       this.pp = a[8];
-      // A WMI client (e.g. wmic) reads the hostname via GetComputerName -- which
-      // we spoof -- then connects to \\<host>\root\cimv2. The fake host isn't
-      // reachable, so redirect the connection target back to "." (local) while
-      // still letting the app *read* the fake name and fake results.
-      try {
-        const res = a[1];
-        if (!res.isNull() && CONFIG.computerName) {
-          const str = res.readUtf16String();
-          if (str && str.toUpperCase().indexOf(CONFIG.computerName.toUpperCase()) !== -1) {
-            let fixed = str.split(CONFIG.computerName).join('.');
-            fixed = fixed.split(CONFIG.computerName.toUpperCase()).join('.');
-            const o = ole();
-            if (o.alloc) a[1] = o.alloc(Memory.allocUtf16String(fixed));
-          }
-        }
-      } catch (e) {}
+      // A client that read the fake hostname may try to connect to
+      // \\<fake>\root\cimv2, which isn't reachable -- point it back at the real
+      // machine while the app still sees the fake name everywhere else.
+      deFakeArg(this, a, 1);
     },
     onLeave: function (r) {
+      freeTmp(this);
       if (r.toInt32() !== 0) return;
       try {
         const svc = this.pp.readPointer();
-        hookVtableMethod(svc, 20, 'IWbemServices::ExecQuery', execQueryCbs);
+        hookVtableMethod(svc, 6,  'IWbemServices::GetObject', getObjectCbs);
+        hookVtableMethod(svc, 7,  'IWbemServices::GetObjectAsync', getObjectAsyncCbs);
         hookVtableMethod(svc, 18, 'IWbemServices::CreateInstanceEnum', createEnumCbs);
-        hookVtableMethod(svc, 6, 'IWbemServices::GetObject', getObjectCbs);
+        hookVtableMethod(svc, 19, 'IWbemServices::CreateInstanceEnumAsync', createEnumAsyncCbs);
+        hookVtableMethod(svc, 20, 'IWbemServices::ExecQuery', execQueryCbs);
+        hookVtableMethod(svc, 21, 'IWbemServices::ExecQueryAsync', execQueryAsyncCbs);
       } catch (e) {}
     },
   };
@@ -768,6 +1041,11 @@ function installWmiClientHooks() {
 /* ------------------------------------------------------------ boot */
 
 function main() {
+  // Read the real machine name first: installComputerNameHooks() is about to
+  // make every later read of it return the profile's fake name, and the WMI /
+  // MI layer needs the real one to recognise (and repair) host references.
+  try { captureRealHost(); } catch (e) {}
+
   try { installRegistryHooks(); } catch (e) {}
   try { installFirmwareHook(); } catch (e) {}
   try { installMacHooks(); } catch (e) {}

@@ -32,6 +32,18 @@ INSTRUMENT_CHILDREN = {
     "vscodium.exe", "cursor.exe", "msedgewebview2.exe", "python.exe",
 }
 
+# "this pid had no entry before we touched the map" -- distinct from a real
+# entry of None, so a rollback can restore the map exactly as it was.
+_MISSING = object()
+
+
+def _restore(mapping: dict, pid: int, prev):
+    """Put `pid` back the way it was: absent if it was absent."""
+    if prev is _MISSING:
+        mapping.pop(pid, None)
+    else:
+        mapping[pid] = prev
+
 
 class GuardEngine:
     def __init__(self, agent_path: Path, config_provider: Callable[[], Optional[dict]]):
@@ -108,19 +120,39 @@ class GuardEngine:
         script.on("message", lambda message, data, _pid=pid: self._on_message(_pid, message, data))
         session.on("detached", lambda reason, *a, _pid=pid: self._on_detached(_pid, reason))
 
-        try:
-            script.load()
-        except Exception as e:
-            self._log_error(pid, name, f"inject failed: {e}")
-            return False
-
+        entry = {
+            "pid": pid, "name": name, "hooked": [], "calls": 0,
+            "since": time.time(), "status": "active", "child": name_hint is not None,
+        }
+        # Register BEFORE loading. script.load() is exactly when the agent runs
+        # main() and sends its {"type": "ready", "hooked": [...]} report (plus
+        # any calls the target makes immediately), and _on_message only records
+        # those if the session entry already exists. Registering afterwards
+        # dropped every hook list. Rolled back below if the load fails.
         with self._lock:
+            prev_session = self._sessions.get(pid, _MISSING)
+            prev_script = self._script_refs.get(pid, _MISSING)
+            prev_ref = self._session_refs.get(pid, _MISSING)
             self._session_refs[pid] = session
             self._script_refs[pid] = script
-            self._sessions[pid] = {
-                "pid": pid, "name": name, "hooked": [], "calls": 0,
-                "since": time.time(), "status": "active", "child": name_hint is not None,
-            }
+            self._sessions[pid] = entry
+
+        try:
+            # Never under self._lock: the agent's messages land on Frida's
+            # reactor thread, which takes the same lock via _on_message.
+            script.load()
+        except Exception as e:
+            with self._lock:
+                # Undo only what we put in, so a detach or a re-instrument that
+                # raced us on this pid keeps its own state.
+                if self._sessions.get(pid) is entry:
+                    _restore(self._sessions, pid, prev_session)
+                if self._script_refs.get(pid) is script:
+                    _restore(self._script_refs, pid, prev_script)
+                if self._session_refs.get(pid) is session:
+                    _restore(self._session_refs, pid, prev_ref)
+            self._log_error(pid, name, f"inject failed: {e}")
+            return False
         return True
 
     def spawn(self, program: str, argv: Optional[list] = None) -> int:

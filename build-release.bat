@@ -33,10 +33,10 @@ if errorlevel 1 (
 )
 echo.
 
-rem --- build (dead modules excluded, --optimize 2, no UPX) ---
+rem --- build (admin manifest, dead modules excluded, --optimize 2, no UPX) ---
 echo Building... this can take a few minutes.
 echo.
-"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name Chameleon ^
+"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name Chameleon ^
   --add-data "ui;ui" --add-data "engine/agent.js;engine" ^
   --collect-all frida --collect-all pythonnet --collect-all clr_loader --collect-all webview ^
   --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 ^
@@ -63,7 +63,8 @@ if exist "dist\Chameleon.exe" (
   echo [OK] Build complete.
   echo      Output : "%~dp0dist\Chameleon.exe"  ^(~!SZMB! MB^)
   echo.
-  echo Run it as Administrator. The Microsoft Edge WebView2 runtime must be
+  echo The exe carries a requireAdministrator manifest, so it prompts for
+  echo elevation on every start. The Microsoft Edge WebView2 runtime must be
   echo installed on the target machine ^(present on Win11 / current Win10/Server^).
 ) else (
   echo [ERROR] Build reported success but dist\Chameleon.exe was not found.

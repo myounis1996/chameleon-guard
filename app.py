@@ -12,8 +12,10 @@ UI is HTML/CSS/JS rendered in a WebView2 window via pywebview.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +28,87 @@ from engine.identity_files import IdentityFileManager, known_targets as id_known
 BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
 AGENT = BASE / "engine" / "agent.js"
+
+
+# --------------------------------------------------------------------------- #
+# Elevation
+#
+# Attaching to an already-running or elevated process needs Administrator
+# rights, so we ask for them up front rather than failing later. The relaunch
+# hands the child a sentinel flag; seeing that flag disables any further
+# elevation attempt, which makes a relaunch loop impossible. (An env var cannot
+# do this job -- ShellExecuteW does not propagate one to the new process.)
+# --------------------------------------------------------------------------- #
+ELEVATED_FLAG = "--elevated"        # sentinel: "you are the relaunched child"
+NO_ELEVATE_FLAG = "--no-elevate"    # developer opt-out
+NO_ELEVATE_ENV = "CHAMELEON_NO_ELEVATE"
+
+
+def _is_admin() -> bool:
+    """True when this process holds an elevated administrator token."""
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+#: Resolved once at import and reused everywhere -- the UI reads it as
+#: ``live.admin``. Re-querying per API call would be pointless: a process's
+#: token never gains elevation while it runs.
+IS_ADMIN = _is_admin()
+
+
+def _elevation_opt_out() -> bool:
+    """Developer escape hatch: env var or command-line flag."""
+    if os.environ.get(NO_ELEVATE_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return NO_ELEVATE_FLAG in sys.argv[1:]
+
+
+def _relaunch_as_admin() -> bool:
+    """Ask UAC to start a second, elevated copy of this app.
+
+    Returns True only when Windows accepted the request -- the caller must then
+    exit and let the elevated copy take over. Returns False when the user
+    answered "No" or the shell refused, in which case we keep running
+    unelevated: launching an app *through* the guard still works, only
+    attaching to an already-running one does not.
+    """
+    if getattr(sys, "frozen", False):
+        # PyInstaller one-file build: sys.executable *is* the app.
+        argv = list(sys.argv[1:])
+    else:
+        # Running from source: the interpreter needs the script path first.
+        argv = [str(Path(__file__).resolve())] + list(sys.argv[1:])
+    argv.append(ELEVATED_FLAG)
+    params = subprocess.list2cmdline(argv)   # Windows-correct quoting
+    try:
+        shell32 = ctypes.windll.shell32
+        # HINSTANCE is pointer-sized; without this the result is truncated.
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        rc = shell32.ShellExecuteW(None, "runas", sys.executable, params, str(BASE), 1)
+        return int(rc or 0) > 32             # <= 32 means declined or failed
+    except Exception:
+        return False
+
+
+def ensure_elevated() -> bool:
+    """Elevate before the window exists. True => this instance should quit.
+
+    A no-op when we are already elevated, when the developer opted out, or when
+    the ``--elevated`` sentinel says we *are* the relaunched child. Never
+    raises and never exits on failure -- an unelevated Chameleon is degraded,
+    not broken, and the UI surfaces that via ``live.admin``.
+    """
+    if IS_ADMIN or os.name != "nt":
+        return False
+    if ELEVATED_FLAG in sys.argv[1:]:        # loop guard -- one attempt, ever
+        return False
+    if _elevation_opt_out():
+        return False
+    return _relaunch_as_admin()
 
 
 def discover_launch_targets() -> list[dict]:
@@ -45,6 +128,35 @@ def discover_launch_targets() -> list[dict]:
         found = next((p for p in paths if p.exists()), None)
         out.append({"name": name, "path": str(found) if found else "", "installed": bool(found)})
     return out
+
+
+# Verify self-test probes. Each is a single PowerShell command line (run under
+# the guard) that prints KEY=value lines, so one spawned process can prove
+# several identifiers at once. They are split by management stack: the classic
+# Win32 / WMI APIs, and the newer MI/CIM stack behind Get-CimInstance,
+# Get-PhysicalDisk and Get-NetAdapter.
+PROBE_WIN32_WMI = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "'HOSTAPI=' + [Environment]::MachineName;"
+    "'BIOS=' + (Get-WmiObject Win32_BIOS).SerialNumber;"
+    "'MAC=' + (Get-WmiObject Win32_NetworkAdapterConfiguration |"
+    " Where-Object {$_.MACAddress} | Select-Object -First 1).MACAddress;"
+    "'DISK=' + (Get-WmiObject Win32_DiskDrive | Select-Object -First 1).SerialNumber"
+)
+
+PROBE_MI_CIM = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "'BOARD=' + (Get-CimInstance Win32_BaseBoard).SerialNumber;"
+    "'UUID=' + (Get-CimInstance Win32_ComputerSystemProduct).UUID;"
+    "'HOST=' + (Get-CimInstance Win32_ComputerSystem).Name;"
+    "'PDISK=' + (Get-CimInstance -Namespace root/Microsoft/Windows/Storage"
+    " -ClassName MSFT_PhysicalDisk | Select-Object -First 1).SerialNumber;"
+    "'CMAC=' + (Get-CimInstance -Namespace root/StandardCimv2"
+    " -ClassName MSFT_NetAdapter | Where-Object {$_.NetworkAddresses} |"
+    " Select-Object -First 1).NetworkAddresses[0];"
+    "'VOLNUM=' + (Get-CimInstance Win32_Volume |"
+    " Where-Object {$_.SerialNumber} | Select-Object -First 1).SerialNumber"
+)
 
 
 # Known AI coding CLIs. Launched through a guarded shell so child-gating catches
@@ -103,6 +215,7 @@ class Api:
             "active_name": prof["name"] if prof else None,
             "enabled": self.store.get_enabled(),
             "wmi": self.store.get_wmi(),
+            "admin": IS_ADMIN,
         }
 
     # -------------------------------------------------- profiles
@@ -137,7 +250,7 @@ class Api:
         fresh["id"] = old["id"]  # keep the slot so 'active' stays valid
         self.store.save(fresh)
         if self.store.get_active_id() == pid and self.store.get_enabled():
-            cfg = self.store.runtime_config(pid)
+            cfg = self._active_config()
             if cfg:
                 self.engine.update_config(cfg)
         return {"ok": True, "profile": fresh}
@@ -146,7 +259,7 @@ class Api:
         if not self.store.get(pid):
             return {"ok": False, "error": "not found"}
         self.store.set_active_id(pid)
-        cfg = self.store.runtime_config(pid)
+        cfg = self._active_config()
         if cfg and self.store.get_enabled():
             self.engine.update_config(cfg)   # live-swap on all running agents
         return {"ok": True, **self._active_summary()}
@@ -172,6 +285,7 @@ class Api:
         if not prof:
             return {"ok": False, "error": "Select or create an identity first."}
         win = os.environ.get("WINDIR", r"C:\Windows")
+        ps = rf"{win}\System32\WindowsPowerShell\v1.0\powershell.exe"
 
         def cap(prog, args, wait=5.0):
             try:
@@ -181,28 +295,54 @@ class Api:
 
         vser = prof["volume_serial"] & 0xFFFFFFFF
         volfmt = f"{vser:08X}"[:4] + "-" + f"{vser:08X}"[4:]
-        checks = [
-            self._vcheck("MachineGuid (registry)", prof["machine_guid"],
-                cap(rf"{win}\System32\reg.exe", ["QUERY", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])),
-            self._vcheck("BIOS serial (WMI)", prof["bios_serial"],
-                cap(rf"{win}\System32\wbem\WMIC.exe", ["bios", "get", "serialnumber"])),
-            self._vcheck("MAC address (WMI)", prof["mac_str"],
-                cap(rf"{win}\System32\wbem\WMIC.exe", ["nic", "get", "macaddress"])),
-            self._vcheck("Disk serial (WMI)", prof["disk_serial"],
-                cap(rf"{win}\System32\wbem\WMIC.exe", ["diskdrive", "get", "serialnumber"])),
-            self._vcheck("Volume serial", volfmt,
-                cap(rf"{win}\System32\cmd.exe", ["/c", "vol", "C:"])),
-            self._vcheck("Hostname", prof["computer_name"],
-                cap(rf"{win}\System32\WindowsPowerShell\v1.0\powershell.exe", ["-NoProfile", "-Command", "[Environment]::MachineName"])),
-        ]
-        return {"ok": True, "checks": checks, "passed": sum(c["pass"] for c in checks), "total": len(checks)}
 
-    def _vcheck(self, name, expected, out):
+        # Two batched probes, one per management stack, so every identifier is
+        # proven on the API an app would really use. Batching keeps the whole
+        # self-test down to four spawned processes.
+        wmi_out = cap(ps, ["-NoProfile", "-Command", PROBE_WIN32_WMI], 25.0)
+        cim_out = cap(ps, ["-NoProfile", "-Command", PROBE_MI_CIM], 35.0)
+
+        checks = [
+            self._vcheck("MachineGuid (registry)", prof["machine_guid"], "Windows API",
+                cap(rf"{win}\System32\reg.exe", ["QUERY", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])),
+            self._vcheck("Volume serial", volfmt, "Windows API",
+                cap(rf"{win}\System32\cmd.exe", ["/c", "vol", "C:"])),
+            self._vline("Hostname", prof["computer_name"], "Windows API", wmi_out, "HOSTAPI"),
+            self._vline("BIOS serial", prof["bios_serial"], "WMI", wmi_out, "BIOS"),
+            self._vline("MAC address", prof["mac_str"], "WMI", wmi_out, "MAC"),
+            self._vline("Disk serial", prof["disk_serial"], "WMI", wmi_out, "DISK"),
+            self._vline("Baseboard serial", prof["baseboard_serial"], "MI / CIM", cim_out, "BOARD"),
+            self._vline("System UUID", prof["system_uuid"], "MI / CIM", cim_out, "UUID"),
+            self._vline("Hostname", prof["computer_name"], "MI / CIM", cim_out, "HOST"),
+            self._vline("Physical disk serial", prof["disk_serial"], "MI / CIM", cim_out, "PDISK"),
+            self._vline("Net adapter MAC", prof["mac_str"].replace(":", ""), "MI / CIM", cim_out, "CMAC"),
+            self._vline("Volume serial (numeric)", str(vser), "MI / CIM", cim_out, "VOLNUM"),
+        ]
+        return {"ok": True, "checks": checks, "wmi": self.store.get_wmi(),
+                "passed": sum(c["pass"] for c in checks), "total": len(checks)}
+
+    def _vcheck(self, name, expected, group, out):
+        """Pass if the expected value appears anywhere in a tool's output."""
         err = out.startswith("__ERR__")
         ok = (not err) and (expected.lower() in out.lower())
-        return {"name": name, "expected": expected, "pass": bool(ok),
+        return {"name": name, "expected": expected, "group": group, "pass": bool(ok),
                 "error": out[8:] if err else None,
                 "snippet": " ".join(out.split())[:90]}
+
+    def _vline(self, name, expected, group, out, key):
+        """Pass if the batched probe's 'KEY=value' line is exactly the fake value."""
+        if out.startswith("__ERR__"):
+            return {"name": name, "expected": expected, "group": group, "pass": False,
+                    "error": out[8:], "snippet": ""}
+        got = ""
+        for line in out.splitlines():
+            line = line.strip()
+            if line.upper().startswith(key.upper() + "="):
+                got = line.split("=", 1)[1].strip()
+                break
+        return {"name": name, "expected": expected, "group": group,
+                "pass": bool(got) and got.lower() == expected.lower(),
+                "error": None, "snippet": got[:90] or "(no value returned)"}
 
     # -------------------------------------------------- auto-attach watcher
     def get_watch_config(self):
@@ -348,6 +488,11 @@ class Api:
 
 
 def main():
+    # Administrator rights first: without them we cannot attach to apps that
+    # are already running. If the UAC prompt is declined we simply carry on
+    # unelevated instead of dying.
+    if ensure_elevated():
+        return   # the elevated copy takes over; this instance is done
     DATA.mkdir(parents=True, exist_ok=True)
     api = Api()
     window = webview.create_window(

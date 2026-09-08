@@ -1,5 +1,9 @@
 # 🦎 Chameleon — Hardware Identity Guard
 
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4)
+![python](https://img.shields.io/badge/python-3.10%2B-3776ab)
+![license](https://img.shields.io/badge/license-MIT-green)
+
 Chameleon sits **between an app and the Windows functions that reveal your
 hardware identity**. When you launch an app "protected", a lightweight Frida
 agent is injected into it (and the helper processes it spawns, like `reg.exe`).
@@ -15,6 +19,16 @@ you choose* — and stops lying the moment you detach.
 > **Your real machine is never modified.** Nothing is written to your registry
 > or firmware. Detach (or toggle Protection off) and apps instantly see the
 > real values again.
+
+## Intended use
+
+Chameleon is a privacy tool for **your own machine**: it decides what *your*
+apps learn about *your* hardware. That is the whole scope. It is not built for,
+and is a poor fit for, evading bans, defeating licensing or trial limits, or
+misrepresenting a machine to someone else's service — it spoofs only inside
+processes you launch, and everything it does disappears when you detach. Check
+the terms of any software you point it at; some prohibit this regardless of
+intent.
 
 ---
 
@@ -32,11 +46,13 @@ you choose* — and stops lying the moment you detach.
 
 ![Live Monitor](docs/monitor.png)
 
+<sub>Screenshots use generated demo identities throughout; in the UI the "real" value is struck through.</sub>
+
 ## Why interception instead of a "HWID changer"
 
 Most HWID spoofers permanently rewrite registry keys or use a kernel driver to
-patch firmware — machine-wide, risky, and hard to undo. Chameleon takes the
-approach you actually want for privacy from *specific apps*:
+patch firmware — machine-wide, risky, and hard to undo. Chameleon scopes the
+problem to privacy from *specific apps* instead:
 
 * **Per-app** — you see exactly which app asked for which identifier.
 * **Reversible by design** — hooks live only inside the target process.
@@ -56,20 +72,54 @@ approach you actually want for privacy from *specific apps*:
 | **Volume serial** | `GetVolumeInformation(W/A)`, `…ByHandleW` | ✅ |
 | **Physical disk serial** | `DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY)` | ✅ |
 | **Hostname** | `GetComputerName(W/A)`; `GetComputerNameEx` caller-guarded (RPC-safe) | ✅ |
-| **WMI** serials / UUID / ProcessorId / MAC / disk / hostname | client-side COM: `IWbemClassObject::Get` + property-enum `Next` | ✅ |
+| **WMI** serials / UUID / ProcessorId / MAC / volume / disk / hostname | client-side COM: `IWbemClassObject::Get` + property-enum `Next` | ✅ |
+| **MI / CIM** (`Get-CimInstance`, `Get-PhysicalDisk`, `Get-NetAdapter`) — same identifiers, plus `MSFT_PhysicalDisk` serial/UniqueId and `MSFT_NetAdapter` addresses | same COM layer, reached through `IWbemServices::*Async` + `IWbemObjectSink::Indicate` | ✅ |
+| **Hostname inside WMI/CIM metadata** (`__SERVER`, `__PATH`, `CimSystemProperties.ServerName`, `ObjectId`) | rewritten outbound, repaired inbound so paths still resolve | ✅ |
 
 The `reg.exe` child process that `node-machine-id` (used by VS Code / Electron
 apps) shells out to is caught automatically via Frida **child-gating**.
 
-### WMI coverage
+### WMI and MI / CIM coverage
 `WmiPrvSE.exe` (the WMI provider host) runs as NETWORK SERVICE and refuses
-injection, so WMI is intercepted **client-side**: a protected app's WMI results
-are unmarshaled into its own process and read via COM, which is hooked. This
-covers the classic WMI stack — `wmic.exe`, .NET `System.Management`, PowerShell
-`Get-WmiObject`, and Node libs that shell out to `wmic` (e.g. `systeminformation`).
-Verified: `wmic bios/csproduct/cpu/baseboard/computersystem` and `Get-WmiObject`
-all return the profile's values. Toggle it in the **Launch & Attach** tab
-(applies to the next launch).
+injection, so both management stacks are intercepted **client-side**: a protected
+app's query results are unmarshaled into its own process and read via COM, which
+is hooked.
+
+One hook point covers both, because **locally, MI does not have its own
+transport**. `mi.dll` exports just `MI_Application_InitializeV1` and
+`mi_clientFT_V1`, and for a local operation it loads `wmidcom.dll` — an ordinary
+DCOM WMI client that goes `CoCreateInstance(CLSID_WbemLocator)` →
+`IWbemLocator::ConnectServer` → `IWbemServices`, uses the *asynchronous* entry
+points, and receives results through an `IWbemObjectSink`. The objects that sink
+delivers are plain in-process `IWbemClassObject`s, which `wmidcom` then reads
+with `Get`/`Next` to build each `MI_Instance`. So hooking those two COM methods —
+plus the async sinks that deliver MI's objects — covers classic WMI and CIM
+together, using only frozen COM ABI rather than `mi.dll`'s build-specific
+internal function-table layout.
+
+Verified coverage on Windows 11:
+
+* classic WMI — .NET `System.Management`, PowerShell `Get-WmiObject`, `wmic.exe`
+  where it still exists, and Node libs that shell out to it (e.g. `systeminformation`);
+* MI / CIM — `Get-CimInstance` (`Win32_BIOS`, `BaseBoard`, `SystemEnclosure`,
+  `ComputerSystemProduct`, `Processor`, `DiskDrive`, `LogicalDisk`, `Volume`,
+  `NetworkAdapterConfiguration`, `ComputerSystem`, `OperatingSystem`),
+  `Get-PhysicalDisk` / `Get-Disk` (`MSFT_PhysicalDisk`, `MSFT_Disk` — including
+  `UniqueId`) and `Get-NetAdapter` (`MSFT_NetAdapter` `PermanentAddress` and
+  `NetworkAddresses`).
+
+Values are class-aware, so `BaseBoard`, `SystemEnclosure` and `DiskDrive` each
+get their own serial rather than a single shared one, and format-preserving, so
+a MAC comes back punctuated the way the real one was (`AA:BB:…`, `AA-BB-…` or
+`AABB…`). String, numeric and string-array properties are all handled —
+`Win32_Volume.SerialNumber` is a `uint32` rather than a string, and
+`MSFT_NetAdapter.NetworkAddresses` is an array. Object paths carrying the
+machine name are rewritten on the way out and repaired on the way back in, so
+`[wmi]$obj.__PATH` and pipelines such as `Get-PhysicalDisk | Get-Disk` keep
+working inside a guarded app.
+
+**WMI / CIM coverage** can be switched off in the **Launch & Attach** tab; the
+change applies to the next launch.
 
 ### AI CLI agents
 The Launch tab auto-detects known AI coding CLIs on `PATH` — Codex, Claude Code,
@@ -78,9 +128,11 @@ opencode, Amazon Q — and launches them in a guarded shell so child-gating
 instruments the node/python/reg helpers they spawn.
 
 ### Verify & auto-attach
-- **Verify active** (Identities tab) launches a set of probe tools *under the
-  guard* and shows, per identifier, whether the app actually receives the
-  profile's fake value — live proof that coverage is working.
+- **Verify active** (Identities tab) launches probe tools *under the guard* and
+  shows, per identifier, whether the app actually receives the profile's fake
+  value — live proof that coverage is working. Results are grouped by the stack
+  the value was read through (Windows API / WMI / MI · CIM), so each stack is
+  proven separately.
 - **Auto-attach watcher** (Launch tab) instruments a configurable watch-list of
   apps the moment they start, so you don't have to launch each one through the
   guard. It polls every ~2s, so reads in the first second of an app's startup
@@ -96,21 +148,27 @@ into it, reversibly.
 
 ---
 
-## Honest limitations
+## Known limitations
 
-* **MI / CIM stack not rewritten.** `Get-CimInstance` (and apps on the newer MI
-  API) read results through `mi.dll` function tables whose in-memory layout does
-  not match the public `mi.h` on current Windows builds, so a reliable
-  cross-version hook isn't feasible without per-build offset maintenance (which
-  would risk crashing apps). Classic WMI — `wmic`, .NET `System.Management`,
-  `Get-WmiObject`, and Node libs that shell out to `wmic` — **is** fully covered.
+* **MI over WSMan isn't intercepted.** Only MI's *local* transport rides on DCOM.
+  An explicit `New-CimSession -ComputerName <host>` (WSMan/WinRM) leaves the
+  machine, so it is neither hooked nor, for a remote host, meaningful to hook.
+  The default local session that `Get-CimInstance` uses is fully covered.
+* **Network adapter GUIDs are left alone.** `Win32_NetworkAdapter.GUID`,
+  `MSFT_NetAdapter.InterfaceGuid` / `DeviceID` are machine-stable, but they are
+  also the keys the networking stack addresses adapters by; rewriting them breaks
+  network cmdlets inside the guarded app for little privacy gain over the MAC,
+  which *is* spoofed.
 * **Hostname vs. local RPC.** Hostname is spoofed via `GetComputerName` and
   `GetComputerNameEx`, plus WMI results. Since local RPC/DCOM binds to the WMI
   host through `GetComputerNameEx`, that hook only rewrites when the caller isn't
   a system RPC/COM/WMI module, and the WMI hook redirects a client's fake-host
   connection back to local — so apps see the fake name while WMI keeps working.
-* **Run as Administrator** to attach to already-running processes and to
-  instrument elevated targets.
+* **Elevation.** Chameleon requests Administrator rights at startup, because
+  attaching to an already-running or elevated process needs them. Decline the
+  prompt and it keeps running unelevated — launching an app *through* the guard
+  still works and is fully protected; only attach-to-running and the auto-attach
+  watcher are unavailable, and the UI says so.
 * **Anti-tamper / EDR.** Frida injects into the target; hardened apps or
   aggressive AV/EDR may detect or block it. The mainstream AI/editor apps do
   not.
@@ -119,27 +177,33 @@ into it, reversibly.
 
 ---
 
+## Requirements
+
+| | |
+|---|---|
+| OS | Windows 10 or 11, 64-bit |
+| Python | 3.10+ (64-bit) — only if running from source |
+| Runtime | Microsoft Edge **WebView2** (preinstalled on Windows 11 and current Windows 10; otherwise install the [Evergreen bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/)) |
+| Privileges | Chameleon **asks for Administrator rights automatically** at startup (a UAC prompt) — they are what lets it attach to already-running or elevated apps. Decline the prompt and it keeps running, just unelevated: launching an app *through* Chameleon still works, attaching to a running one does not. Developers can skip the prompt with `--no-elevate` or `CHAMELEON_NO_ELEVATE=1`. |
+
+Dependencies (`requirements.txt`): [Frida](https://frida.re) 17+ for the
+instrumentation, pywebview + pythonnet for the WebView2 UI.
+
 ## Install & run
 
-Already set up on this machine (Python 3.12, Frida, pywebview, WebView2 runtime).
-
 ```bat
+git clone https://github.com/myounis1996/chameleon-guard.git
+cd chameleon-guard
+pip install -r requirements.txt
 run.bat
 ```
 
-or
+`run.bat` is equivalent to `python app.py`. To produce a single-file
+`Chameleon.exe` instead, see [Building the release .exe](#building-the-release-exe).
 
-```bat
-python app.py
-```
-
-Fresh machine:
-
-```bat
-pip install -r requirements.txt
-:: install the Microsoft Edge WebView2 runtime if missing
-python app.py
-```
+> Your generated profiles, engine state and Identity-File backups live in
+> `data/`, which is **gitignored** — the backups contain your machine's **real**
+> ids, so keep them out of version control.
 
 ### Usage
 1. **Identities** — **＋ New Identity** generates a full, consistent fake machine
@@ -154,7 +218,7 @@ python app.py
    - **Attach** to an already-running process.
    - **Auto-attach watcher**: toggle on and set a watch-list to instrument apps
      automatically as they start.
-   - **WMI coverage** toggle (applies to the next launch).
+   - **WMI / CIM coverage** toggle (applies to the next launch).
 3. **Live Monitor** — every intercepted call in real time: counts per app and per
    function, and real → served for each.
 4. **Identity Files** — for VS Code-family apps that cache their id in
@@ -166,7 +230,7 @@ python app.py
 ## Project layout
 
 ```
-hw_profile/
+chameleon-guard/
 ├─ app.py                    # pywebview window + JS API bridge + app discovery
 ├─ run.bat                   # launcher (double-click)
 ├─ build-release.bat         # build dist\Chameleon.exe (double-click)
@@ -185,13 +249,14 @@ hw_profile/
 
 **Double-click `build-release.bat`** — it locates Python, installs the build
 dependencies, and produces a single self-contained `dist\Chameleon.exe` (~52 MB,
-dead modules excluded, compiled with `--optimize 2`).
+dead modules excluded, compiled with `--optimize 2`). `--uac-admin` gives the exe
+a `requireAdministrator` manifest, so Windows prompts for elevation on every start.
 
 Or run the equivalent manually:
 
 ```bat
 pip install pyinstaller
-pyinstaller --noconfirm --clean --onefile --windowed --name Chameleon ^
+pyinstaller --noconfirm --clean --onefile --windowed --uac-admin --name Chameleon ^
   --add-data "ui;ui" --add-data "engine/agent.js;engine" ^
   --collect-all frida --collect-all pythonnet --collect-all clr_loader --collect-all webview ^
   --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 ^
@@ -214,7 +279,16 @@ antivirus false-positives far more likely.
   Windows 11 and up-to-date Windows 10/Server; otherwise ship the Evergreen
   bootstrapper).
 - Because it bundles Frida and injects into other processes, some antivirus /
-  EDR may flag the exe. Run as Administrator.
+  EDR may flag the exe.
+
+## Contributing
+
+Issues and PRs welcome. Coverage gaps are the most useful reports: say which
+**app** read which **identifier**, and how you observed the real value getting
+through (the Live Monitor and **Verify active** panel are the quickest evidence).
+New hooks belong in `engine/agent.js` and should follow the rules at the top of
+that file — never resize a caller's buffer, never let a hook throw into the
+target, and add a matching row to the Verify self-test in `app.py`.
 
 ## License
 
