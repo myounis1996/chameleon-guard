@@ -33,7 +33,7 @@ if errorlevel 1 (
 )
 echo.
 
-rem --- build (admin manifest, dead modules excluded, --optimize 2, no UPX) ---
+rem --- build (admin manifest, dead modules excluded, --optimize 1, no UPX) ---
 echo Building... this can take a few minutes.
 echo.
 "%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name Chameleon ^
@@ -46,7 +46,7 @@ echo.
   --exclude-module notebook --exclude-module sqlite3 ^
   --exclude-module webview.platforms.gtk --exclude-module webview.platforms.qt ^
   --exclude-module webview.platforms.cocoa --exclude-module webview.platforms.android ^
-  --optimize 2 app.py
+  --optimize 1 app.py
 
 if errorlevel 1 (
   echo.
